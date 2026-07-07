@@ -1,5 +1,14 @@
 name: CI
 
+# Two independent jobs:
+#   * tests     — FUNCTIONAL. Pure-Python unit tests (token-bucket math, config loader,
+#                 IP<->key round-trip). No root, no BPF, no kernel needed — these actually run.
+#   * ebpf-build — COMPILE-ONLY. clang -target bpf produces the XDP object and we assert the
+#                 maps/xdp ELF sections exist. GitHub-hosted runners cannot load/attach an XDP
+#                 program (no privileged NIC / no live XDP), so this verifies the program
+#                 *compiles* — it does not exercise the running filter. Live XDP behavior is
+#                 validated manually via the netns lab (see docs/runbooks/) and scripts/load_test.py.
+
 on:
   push:
     branches: [main]
@@ -8,7 +17,7 @@ on:
 
 jobs:
   tests:
-    name: Python tests (pure-logic, no BPF)
+    name: Python unit tests (functional)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,14 +27,14 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest flask prometheus_client
+          pip install -r requirements.txt
       - name: Byte-compile all sources
-        run: python -m py_compile fluxguard_*.py test_fluxguard.py some.py
+        run: python -m py_compile src/*.py tests/*.py scripts/*.py
       - name: Run unit tests
-        run: python -m pytest test_fluxguard.py -v
+        run: python -m pytest tests/ -v
 
   ebpf-build:
-    name: Build XDP/eBPF object (clang -target bpf)
+    name: Build XDP/eBPF object (compile-only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +42,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev
-      - name: Compile fluxguard_kern.c
+      - name: Compile src/fluxguard_kern.c
+        run: make build
+      - name: Verify BPF ELF sections present (maps + xdp)
         run: |
-          clang -O2 -g -Wall -target bpf \
-            -I/usr/include/$(uname -m)-linux-gnu \
-            -c fluxguard_kern.c -o fluxguard_kern.o
-      - name: Verify BPF sections present
-        run: |
-          llvm-objdump -h fluxguard_kern.o | grep -E "maps|xdp"
+          llvm-objdump -h src/fluxguard_kern.o | grep -E "maps|xdp"
