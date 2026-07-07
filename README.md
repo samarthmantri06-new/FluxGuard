@@ -10,8 +10,10 @@ manages the block lifecycle, exposes Prometheus metrics, and persists state, tal
 kernel **only** through pinned eBPF maps.
 
 > **Scope note:** FluxGuard is a systems-programming project, validated in a Linux network-namespace
-> lab and an Ubuntu VM (see the phase runbooks). The throughput ceilings (`GLOBAL_PPS_LIMIT = 500000`)
-> are *design targets*, not benchmarked results on production hardware.
+> lab and an Ubuntu VM (see the runbooks in `docs/runbooks/`). The configured ceiling
+> (`GLOBAL_PPS_LIMIT = 500000`) is a *policy limit*, not a hardware benchmark. A repeatable
+> benchmark harness lives at `scripts/load_test.py`; see [Performance](#performance) for how to
+> run it and record real numbers.
 
 ---
 
@@ -140,6 +142,34 @@ make test        # or: python3 -m pytest tests/ -v
 
 They cover the token-bucket refill math (mirror of the C helper), IP↔key round-tripping,
 and config loading.
+
+---
+
+## Performance
+
+`scripts/load_test.py` drives `hping3` at increasing packet rates against the protected
+interface and records, per step: **pps sent** (client TX delta), **pps passed** (backend RX
+delta), **pps dropped**, and the XDP program's real cost — **ns/packet** and **CPU%** — read
+from `bpftool prog show` with `kernel.bpf_stats_enabled=1`.
+
+```bash
+# lab must be up and FluxGuard attached first (see docs/runbooks/)
+sudo python3 scripts/load_test.py \
+    --target 10.0.2.2 --rates 1000,5000,20000,100000,500000 \
+    --duration 5 --csv results.csv
+```
+
+It needs root, a real kernel, and a loaded XDP program, so it **cannot run in CI** — run it
+in the Ubuntu VM / netns lab.
+
+Measured results (fill in after running on your hardware — replace this placeholder):
+
+| Target PPS | Sent | Passed | Dropped | Drop % | XDP ns/pkt | XDP CPU % | Env |
+|-----------:|-----:|-------:|--------:|-------:|-----------:|----------:|-----|
+| _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _CPU model, kernel, xdpgeneric/xdpdrv_ |
+
+> **TODO:** record a short demo GIF (asciinema/terminal capture) of a live flood being
+> auto-blocked, and embed it here. (Recording is a manual step — not scriptable from CI.)
 
 ---
 
