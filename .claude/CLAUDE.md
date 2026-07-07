@@ -9,10 +9,11 @@ FluxGuard is an XDP/eBPF-based DDoS mitigation system for Linux. A kernel XDP pr
 level; a userspace Python "brain" and set of CLIs/servers observe and manage the eBPF maps
 that the kernel program exposes.
 
-The project was built in numbered phases. `FLUXGUARD_COMMANDS_samarth_phaseN.txt` are the
-per-phase runbooks (build/attach/test command sequences), and `phaseN_phaseM_explained.md`
-are the design writeups. The current code is Phase 11 (kernel/brain/tools) with Phase 12
-adding config + REST API. **Development and deployment target Linux only** — the code uses
+The project was built in numbered phases. `docs/runbooks/phaseNN-*.txt` are the per-phase
+runbooks (build/attach/test command sequences), and `docs/phaseNN-*.md` are the design
+writeups. The current code is Phase 13 (kernel/brain/tools + config + REST API + tests +
+CI). Application code lives in `src/`, tests in `tests/`, helper scripts in `scripts/`.
+**Development and deployment target Linux only** — the code uses
 `libc.so.6`, the `bpf(2)` syscall, and `/sys/fs/bpf`, none of which exist on the Windows
 host this repo is edited from. Runtime testing happens in an Ubuntu VM / netns lab.
 
@@ -89,33 +90,37 @@ between the Python processes other than these maps (plus the on-disk checkpoint/
 
 ## Common commands
 
-All runtime commands are Linux + `sudo`, run from the project dir (`/home/samarth/fluxguard`
-in the VM). There is no test suite, linter, or package manifest checked in — verification is
-manual via the phase runbooks.
+The `Makefile` is the entrypoint for everything — it wraps the per-phase runbooks. Code
+lives in `src/`, so raw invocations use `src/fluxguard_*.py`. Runtime commands are Linux +
+`sudo`.
 
-Build the XDP object:
+Build + unit tests (tests are pure-Python, run anywhere — no root, no BPF):
 ```bash
-clang -O2 -g -Wall -target bpf -I/usr/include/$(uname -m)-linux-gnu \
-    -c fluxguard_kern.c -o fluxguard_kern.o
-llvm-objdump -h fluxguard_kern.o | grep -E "maps|xdp"   # sanity-check sections
+make build      # clang -target bpf src/fluxguard_kern.c -> src/fluxguard_kern.o
+make verify     # llvm-objdump -h | grep -E "maps|xdp"
+make test       # python3 -m pytest tests/ -v   (12 tests: token bucket, config, IP<->key)
 ```
 
-Attach XDP (netns lab; VirtualBox needs generic mode) and pin every map — see
-`FLUXGUARD_COMMANDS_samarth_phase11.txt` steps 4–5 for the exact attach + pin loop, and
-`phase1` for the `ip netns` topology setup (client 10.0.1.1 → fluxguard → backend 10.0.2.2).
-
-Run the components:
+Attach XDP (netns lab; VirtualBox needs generic mode) and pin every map:
 ```bash
-sudo python3 fluxguard_brain.py --netns fluxguard --poll-interval 0.2 \
-    --cooldown-sec 30 --allowlist-refresh-sec 5 --verbose \
-    --log-file /home/samarth/fluxguard/fluxguard.log
-sudo python3 fluxguard_dashboard.py --metrics-url http://127.0.0.1:9090/metrics \
+sudo make attach IFACE=veth-fg              # netns lab, generic mode + pins all maps
+sudo make attach IFACE=eth0 XDP_MODE=xdpdrv # real NIC, native driver
+```
+See `docs/runbooks/phase11-ipv6-persistence.txt` for the manual attach + pin loop, and
+`docs/runbooks/phase01-install-netns.txt` for the `ip netns` topology (client 10.0.1.1 →
+fluxguard → backend 10.0.2.2).
+
+Run the components (or `make run-brain` / `run-dashboard` / `run-api`):
+```bash
+sudo python3 src/fluxguard_brain.py --netns fluxguard --poll-interval 0.2 \
+    --cooldown-sec 30 --allowlist-refresh-sec 5 --verbose
+sudo python3 src/fluxguard_dashboard.py --metrics-url http://127.0.0.1:9090/metrics \
     --ringbuf-path /sys/fs/bpf/fluxguard/event_ringbuf --refresh 2.0
-sudo python3 fluxguard_allow.py add 10.0.1.5
-python3 fluxguard_api.py            # Flask dev server, port 8080
+sudo python3 src/fluxguard_allow.py add 10.0.1.5
+python3 src/fluxguard_api.py            # Flask dev server, port 8080
 ```
 
-Exercise / test (there are no unit tests — this is how behavior is validated):
+Exercise the live XDP path (behavior validation beyond the unit tests):
 ```bash
 sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2          # trigger per-IP auto-block
 sudo ip netns exec client hping3 --rate 900  -S -p 80 -c 1000 10.0.2.2  # under limit → passes
@@ -124,10 +129,11 @@ curl -s http://127.0.0.1:9090/metrics | grep -E "blocked_ip|shields|global"
 ```
 The full labeled test plan (TEST 1–13: normal traffic, IPv4/IPv6 floods, persistence
 restart, allowlist refresh timing, protocol filter, Shields-Up) is in
-`FLUXGUARD_COMMANDS_samarth_phase11.txt`. Phase-12 production deployment (systemd units,
-config, real NIC) is in `FLUXGUARD_COMMANDS_samarth_phase12.txt`.
+`docs/runbooks/phase11-ipv6-persistence.txt`. Production deployment (systemd units, config,
+real NIC) is in `docs/runbooks/phase12-production-deploy.txt`. A synthetic throughput
+harness is `scripts/load_test.py`.
 
-Python deps (not pinned in-repo): `prometheus_client`, `flask`, `toml`.
+Python deps (`requirements.txt`): `prometheus_client`, `flask`, `toml`, `pytest`.
 
 
 ## System Instructions

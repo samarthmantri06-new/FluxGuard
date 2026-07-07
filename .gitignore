@@ -29,5 +29,7 @@ codebase_dump.txt
 .DS_Store
 Thumbs.db
 
-# Claude Code local settings
-.claude/
+# Claude Code local settings (keep .claude/CLAUDE.md tracked; ignore machine-local state)
+.claude/settings.local.json
+.claude/projects/
+.claude/*.local.json
