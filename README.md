@@ -1,5 +1,7 @@
 # FluxGuard
 
+[![CI](https://github.com/samarthmantri06-new/FluxGuard/actions/workflows/ci.yml/badge.svg)](https://github.com/samarthmantri06-new/FluxGuard/actions/workflows/ci.yml)
+
 **XDP/eBPF in-kernel DDoS mitigation for Linux.**
 
 FluxGuard rate-limits and auto-blocks flooding source IPs at the NIC driver level — before

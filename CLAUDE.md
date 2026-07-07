@@ -78,9 +78,14 @@ between the Python processes other than these maps (plus the on-disk checkpoint/
   parallel set of tunables also lives in `fluxguard_config.py` / the deployed
   `config.json`/`config.toml`. They are not auto-synced; the kernel constants win unless code
   explicitly writes a threshold into a map.
-- **`fluxguard_api.py` has known rough edges** (e.g. it passes map *name strings* to
-  `dump_map_u32`, which expects an fd; the IPv6 formatting uses `"...".format(*k)` against a
-  `%`-style template). Treat its endpoints as illustrative and verify before relying on them.
+- **`fluxguard_api.py` (Phase 13) opens its maps once at import** via `bpf_obj_get` against
+  `cfg.bpf_pin_dir`, and uses the helper contract correctly (string IPs in, `{ip: val}` dicts
+  out). If a map isn't loaded it returns HTTP 503 rather than crashing. Earlier phases had a
+  fd-vs-name bug here — keep new endpoints on the same `bpf_obj_get` → helper path.
+- **The brain is CLI/argparse-driven and does not import `fluxguard_config.py`.** The config
+  module is consumed by `fluxguard_api.py`; a unit test (`test_no_pps_limit_drift`) guards the
+  config default against the kernel `#define`. Don't assume changing `config.json` retunes the
+  brain — it doesn't.
 
 ## Common commands
 

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Python tests (pure-logic, no BPF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest flask prometheus_client
+      - name: Byte-compile all sources
+        run: python -m py_compile fluxguard_*.py test_fluxguard.py some.py
+      - name: Run unit tests
+        run: python -m pytest test_fluxguard.py -v
+
+  ebpf-build:
+    name: Build XDP/eBPF object (clang -target bpf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang / llvm / libbpf headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev
+      - name: Compile fluxguard_kern.c
+        run: |
+          clang -O2 -g -Wall -target bpf \
+            -I/usr/include/$(uname -m)-linux-gnu \
+            -c fluxguard_kern.c -o fluxguard_kern.o
+      - name: Verify BPF sections present
+        run: |
+          llvm-objdump -h fluxguard_kern.o | grep -E "maps|xdp"
