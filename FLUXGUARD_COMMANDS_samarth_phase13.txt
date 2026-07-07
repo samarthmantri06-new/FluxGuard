@@ -1,0 +1,112 @@
+# =============================================================================
+# FluxGuard Phase 13 – Release Hardening & Publishing
+# =============================================================================
+# The final phase. Consolidates the per-phase runbooks into a clean build/test/
+# deploy/publish flow, fixes the known rough edges, and prepares the repo for
+# GitHub. All paths assume the project lives in $HOME/fluxguard.
+#
+# What changed in Phase 13 (code):
+#   - fluxguard_api.py rewritten: opens pinned maps via bpf_obj_get() ONCE at
+#     startup and uses the fluxguard_bpf helper contract correctly (Phase 12 passed
+#     map *name strings* where an fd was required, and its IPv6 formatter was dead).
+#   - fluxguard_config.py: kern_pps_limit synced 10000 -> 1000 to match the kernel
+#     #define (KERN_PPS_LIMIT). Config is display-only; the kernel constant wins.
+#   - Added: README.md, LICENSE (GPL-2.0), requirements.txt, .gitignore, Makefile,
+#     test_fluxguard.py.
+#   - NOTE: earlier runbooks used `sec .text` when attaching XDP. The program is
+#     SEC("xdp"), so the correct section is `xdp` (used below and in the Makefile).
+# =============================================================================
+
+# 1) System dependencies (Ubuntu; run as root or with sudo)
+sudo apt update && sudo apt install -y \
+    clang llvm libelf-dev libbpf-dev gcc iproute2 iputils-ping hping3 \
+    python3-pip python3-venv git bpftool
+
+cd $HOME/fluxguard
+
+# 2) Python environment + deps
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3) Run the pure-Python test suite FIRST (no root, no BPF — must be green)
+make test
+# equivalently: python3 -m pytest test_fluxguard.py -v
+# On Linux all tests run; the BPF-key round-trip tests exercise fluxguard_bpf too.
+
+# 4) Build the XDP kernel object
+make build          # clang -O2 -g -Wall -target bpf ... -c fluxguard_kern.c -o fluxguard_kern.o
+make verify         # llvm-objdump -h fluxguard_kern.o | grep -E "maps|xdp"
+
+# 5a) Attach in the netns lab (VirtualBox / generic mode)
+#     (bring the lab up first — see FLUXGUARD_COMMANDS_samarth_phase1.txt)
+sudo make attach IFACE=veth-fg XDP_MODE=xdpgeneric NETNS=fluxguard
+
+# 5b) OR attach to a real NIC in native driver mode
+IFACE=$(ip link | awk -F': ' '/^[0-9]+: / && $2 != "lo" {print $2; exit}')
+sudo make attach IFACE=$IFACE XDP_MODE=xdpdrv NETNS=fluxguard
+# maps are pinned under /sys/fs/bpf/fluxguard
+
+# 6) Deploy config (JSON — matches fluxguard_config.py)
+sudo mkdir -p /etc/fluxguard /var/lib/fluxguard /var/log/fluxguard
+sudo tee /etc/fluxguard/config.json >/dev/null <<'EOF'
+{
+  "interface": "eth0",
+  "xdp_mode": "xdpdrv",
+  "bpf_pin_dir": "/sys/fs/bpf/fluxguard",
+  "kern_pps_limit": 1000,
+  "global_pps_limit": 500000,
+  "poll_interval": 0.2,
+  "cooldown_sec": 900,
+  "allowlist_refresh_sec": 5.0,
+  "persistence_file": "/var/lib/fluxguard/blocked_ips.json",
+  "log_file": "/var/log/fluxguard/fluxguard.log",
+  "metrics_host": "127.0.0.1",
+  "metrics_port": 9090,
+  "api_host": "127.0.0.1",
+  "api_port": 8080,
+  "api_token": "change-me-secret",
+  "drop_protocols": [],
+  "verbose": false,
+  "no_log_ticks": true
+}
+EOF
+
+# 7) Run the components
+sudo make run-brain                     # control loop + Prometheus /metrics
+# in another shell:
+sudo make run-dashboard                 # read-only TUI (metrics + live ring-buffer events)
+sudo make run-api                       # Flask REST API on :8080
+
+# 8) Smoke-test the REST API (Phase 13 fix — these actually work now)
+curl -s http://127.0.0.1:8080/api/v1/health
+curl -s -X POST http://127.0.0.1:8080/api/v1/allowlist \
+     -H 'Content-Type: application/json' -d '{"ip":"10.0.1.5"}'
+curl -s http://127.0.0.1:8080/api/v1/allowlist
+curl -s http://127.0.0.1:8080/api/v1/blocked
+curl -s http://127.0.0.1:8080/api/v1/metrics | head -n 20
+# with auth enabled (api_token set):
+#   curl -s -H 'Authorization: Bearer change-me-secret' http://127.0.0.1:8080/api/v1/blocked
+
+# 9) Behavioural validation (see phase11 TEST 1-13 for the full plan)
+sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2            # per-IP auto-block
+sudo ip netns exec client hping3 --flood --rand-source -S -p 80 10.0.2.2  # global Shields-Up
+curl -s http://127.0.0.1:9090/metrics | grep -E "blocked_ip|shields|global"
+
+# 10) Publish to GitHub
+git init
+git add .
+git status                              # confirm .gitignore excludes *.log, blocked_ips.json, graphify-out/
+git commit -m "FluxGuard: XDP/eBPF DDoS mitigation (phases 1-13)"
+git branch -M main
+git remote add origin git@github.com:<your-username>/fluxguard.git
+git push -u origin main
+
+# 11) Teardown
+sudo make detach IFACE=$IFACE           # remove XDP + unpin maps
+make clean                              # remove build artifacts
+
+# =============================================================================
+# End of Phase 13. FluxGuard is release-ready.
+# =============================================================================

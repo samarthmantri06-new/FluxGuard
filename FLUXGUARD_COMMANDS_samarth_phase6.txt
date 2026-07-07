@@ -1,0 +1,602 @@
+# Phase 6: Hardening (run after Phase 5 on the same lab; Phases 1–5 above unchanged)
+# ==============================================================================
+# Addresses: Prometheus gauge naming (fluxguard_meter_packets, fluxguard_blocked_ips),
+# u32 wrap-safe deltas, one open JSON log fd, SIGTERM/SIGINT shutdown, allowlist-aware
+# brain (skips block if IP is in allowlist_map), metrics bind default 127.0.0.1,
+# bpftool-per-poll documented as demo trade-off (future: libbpf/ctypes).
+#
+# Phase 6: Write hardened version of Prometheus metrics module
+cat > /home/samarth/fluxguard/fluxguard_metrics.py <<'EOF_METRICS_P6'
+#!/usr/bin/env python3
+"""
+FluxGuard Phase 6 — Prometheus text metrics over HTTP (stdlib only).
+
+Exposes GET /metrics on a background thread; state is updated from the brain.
+"""
+
+from __future__ import annotations
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict
+
+
+class MetricsState:
+    """Thread-safe snapshot for Prometheus exposition."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._packets_by_ip: Dict[str, int] = {}
+        self._blocked_ips = 0
+        self._block_events = 0
+        self._unblock_events = 0
+
+    def update_snapshot(self, packets_by_ip: Dict[str, int], blocked_ips: int) -> None:
+        with self._lock:
+            self._packets_by_ip = dict(packets_by_ip)
+            self._blocked_ips = int(blocked_ips)
+
+    def inc_block_events(self) -> None:
+        with self._lock:
+            self._block_events += 1
+
+    def inc_unblock_events(self) -> None:
+        with self._lock:
+            self._unblock_events += 1
+
+    def render_prometheus_text(self) -> str:
+        with self._lock:
+            packets = sorted(self._packets_by_ip.items())
+            blocked = self._blocked_ips
+            be = self._block_events
+            ue = self._unblock_events
+
+        lines = [
+            "# HELP fluxguard_meter_packets Current packet counter per source IP from meter_map.",
+            "# TYPE fluxguard_meter_packets gauge",
+        ]
+        for ip, cnt in packets:
+            safe = ip.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append('fluxguard_meter_packets{ip="%s"} %d' % (safe, cnt))
+        lines.extend(
+            [
+                "# HELP fluxguard_blocked_ips Number of IPs currently blocked by the brain.",
+                "# TYPE fluxguard_blocked_ips gauge",
+                "fluxguard_blocked_ips %d" % blocked,
+                "# HELP fluxguard_block_events_total Cumulative block events since brain start.",
+                "# TYPE fluxguard_block_events_total counter",
+                "fluxguard_block_events_total %d" % be,
+                "# HELP fluxguard_unblock_events_total Cumulative unblock events since brain start.",
+                "# TYPE fluxguard_unblock_events_total counter",
+                "fluxguard_unblock_events_total %d" % ue,
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+
+def start_metrics_server(state: MetricsState, host: str, port: int) -> threading.Thread:
+    """Start HTTP /metrics in a daemon thread. Returns the thread object."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802 (stdlib API)
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = state.render_prometheus_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def run() -> None:
+        server = HTTPServer((host, port), Handler)
+        server.serve_forever()
+
+    thread = threading.Thread(target=run, name="fluxguard-metrics", daemon=True)
+    thread.start()
+    return thread
+EOF_METRICS_P6
+
+# Phase 6: Write hardened version of brain module
+cat > /home/samarth/fluxguard/fluxguard_brain.py <<'EOF_BRAIN_P6'
+#!/usr/bin/env python3
+"""
+FluxGuard Phase 6 - Brain + metrics + JSON logging (Hardened)
+
+Ubuntu-focused controller that:
+1) Reads packet counters from meter_map using bpftool --json
+2) Detects abusive packet rates per source IP, skipping allowlist
+3) Writes offenders to blacklist_map
+4) Auto-unblocks offenders after cooldown ("amnesty")
+5) Exposes Prometheus /metrics (fluxguard_metrics.py) and JSON line logs
+6) Gracefully handles SIGTERM
+
+Run from host namespace (recommended):
+    sudo python3 fluxguard_brain.py --netns fluxguard
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import ipaddress
+import json
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, TextIO
+
+from fluxguard_metrics import MetricsState, start_metrics_server
+
+
+@dataclass
+class Config:
+    netns: str
+    meter_map: str
+    blacklist_map: str
+    allowlist_map: str
+    pps_threshold: float
+    poll_interval: float
+    cooldown_sec: int
+    block_batch_size: int
+    verbose: bool
+    no_log_ticks: bool
+    log_file: str
+    metrics_host: str
+    metrics_port: int
+
+
+shutdown_event = threading.Event()
+
+def handle_sigterm(signum: int, frame: Any) -> None:
+    shutdown_event.set()
+
+
+def run_cmd(cmd: List[str]) -> str:
+    """Run command and return stdout. Raise RuntimeError on failure."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip()
+        stdout = exc.stdout.strip()
+        msg = (
+            f"Command failed: {' '.join(cmd)}\n"
+            f"exit={exc.returncode}\n"
+            f"stdout={stdout}\n"
+            f"stderr={stderr}"
+        )
+        raise RuntimeError(msg) from exc
+    return proc.stdout
+
+
+def bpftool_json(netns: str, args: List[str]) -> object:
+    cmd = ["sudo", "ip", "netns", "exec", netns, "bpftool", "--json"] + args
+    output = run_cmd(cmd)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid JSON from bpftool for args {args}:\n{output}"
+        ) from exc
+
+
+def ip_to_key_hex(ip_str: str) -> str:
+    ip = ipaddress.IPv4Address(ip_str)
+    return " ".join(f"{b:02x}" for b in ip.packed)
+
+
+def extract_hex_tokens_from_field(field: object) -> List[str]:
+    tokens: List[str] = []
+
+    if isinstance(field, list):
+        for item in field:
+            if isinstance(item, int):
+                tokens.append(f"{item & 0xFF:02x}")
+            elif isinstance(item, str):
+                cleaned = item.strip().lower().replace("0x", "")
+                if cleaned:
+                    tokens.extend(cleaned.split())
+    elif isinstance(field, str):
+        cleaned = field.strip().lower().replace("0x", "")
+        if cleaned:
+            tokens.extend(cleaned.split())
+    elif isinstance(field, int):
+        tokens.append(f"{field & 0xFF:02x}")
+    elif isinstance(field, dict):
+        for nested_key in ("bytes", "data", "raw"):
+            if nested_key in field:
+                return extract_hex_tokens_from_field(field[nested_key])
+
+    return tokens
+
+
+def key_tokens_to_ipv4(tokens: List[str]) -> Optional[str]:
+    if len(tokens) < 4:
+        return None
+    try:
+        b = bytes(int(t, 16) for t in tokens[:4])
+        return str(ipaddress.IPv4Address(b))
+    except Exception:
+        return None
+
+
+def value_tokens_to_u32(tokens: List[str]) -> Optional[int]:
+    if len(tokens) < 4:
+        return None
+    try:
+        b0, b1, b2, b3 = (int(tokens[i], 16) for i in range(4))
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    except Exception:
+        return None
+
+
+def parse_map_dump(raw: object) -> Dict[str, int]:
+    result: Dict[str, int] = {}
+    if not isinstance(raw, list):
+        return result
+
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+
+        key_obj = entry.get("key")
+        val_obj = entry.get("value")
+        if key_obj is None or val_obj is None:
+            continue
+
+        key_tokens = extract_hex_tokens_from_field(key_obj)
+        val_tokens = extract_hex_tokens_from_field(val_obj)
+
+        ip = key_tokens_to_ipv4(key_tokens)
+        count = value_tokens_to_u32(val_tokens)
+
+        if ip is None or count is None:
+            continue
+        result[ip] = count
+
+    return result
+
+
+def write_json_log(fd: TextIO, event: str, fields: Dict[str, Any]) -> None:
+    ts = (
+        datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        + "Z"
+    )
+    record: Dict[str, Any] = {"timestamp": ts, "event": event}
+    record.update(fields)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    fd.write(line)
+    fd.flush()
+
+
+def dump_map(cfg: Config, map_name: str) -> Dict[str, int]:
+    raw = bpftool_json(cfg.netns, ["map", "dump", "name", map_name])
+    return parse_map_dump(raw)
+
+
+def map_update_blacklist(cfg: Config, ip_str: str) -> None:
+    key_hex = ip_to_key_hex(ip_str)
+    cmd = [
+        "sudo",
+        "ip",
+        "netns",
+        "exec",
+        cfg.netns,
+        "bpftool",
+        "map",
+        "update",
+        "name",
+        cfg.blacklist_map,
+        "key",
+        "hex",
+    ] + key_hex.split() + ["value", "hex", "01", "00", "00", "00"]
+    run_cmd(cmd)
+
+
+def map_delete_blacklist(cfg: Config, ip_str: str) -> None:
+    key_hex = ip_to_key_hex(ip_str)
+    cmd = [
+        "sudo",
+        "ip",
+        "netns",
+        "exec",
+        cfg.netns,
+        "bpftool",
+        "map",
+        "delete",
+        "name",
+        cfg.blacklist_map,
+        "key",
+        "hex",
+    ] + key_hex.split()
+    run_cmd(cmd)
+
+
+def monitor(cfg: Config, metrics: MetricsState, log_fd: TextIO) -> None:
+    prev_counts: Dict[str, int] = {}
+    prev_ts = time.monotonic()
+    blocked_until: Dict[str, float] = {}
+    allowlist_cache: Dict[str, int] = {}
+    allowlist_ts: float = 0.0
+
+    print(
+        "FluxGuard Phase 6 brain started "
+        f"(threshold={cfg.pps_threshold:.1f} pps, cooldown={cfg.cooldown_sec}s)"
+    )
+    print(
+        "Metrics: http://%s:%d/metrics  Log: %s"
+        % (cfg.metrics_host, cfg.metrics_port, cfg.log_file)
+    )
+    print("Press Ctrl+C or send SIGTERM to stop.")
+
+    while not shutdown_event.is_set():
+        now = time.monotonic()
+        dt = now - prev_ts
+        if dt <= 0:
+            dt = cfg.poll_interval
+
+        if now - allowlist_ts >= 30.0:
+            try:
+                allowlist_cache = dump_map(cfg, cfg.allowlist_map)
+                allowlist_ts = now
+            except RuntimeError as exc:
+                print(f"[WARN] allowlist map read failed: {exc}", file=sys.stderr)
+
+        try:
+            curr_counts = dump_map(cfg, cfg.meter_map)
+        except RuntimeError as exc:
+            print(f"[WARN] bpf map read failed: {exc}", file=sys.stderr)
+            time.sleep(cfg.poll_interval)
+            prev_ts = time.monotonic()
+            continue
+
+        # Detect offenders and batch block.
+        to_block: List[Tuple[str, float, int]] = []
+        for ip, curr in curr_counts.items():
+            if ip in allowlist_cache:
+                continue
+
+            prev = prev_counts.get(ip, curr)
+
+            # Handle map resets / counter wrap gracefully.
+            delta = curr - prev if curr >= prev else curr
+            pps = delta / dt
+
+            if pps >= cfg.pps_threshold and ip not in blocked_until:
+                to_block.append((ip, pps, curr))
+
+        if to_block:
+            # Highest PPS first so severe offenders get priority.
+            to_block.sort(key=lambda x: x[1], reverse=True)
+            if cfg.block_batch_size > 0:
+                to_block = to_block[: cfg.block_batch_size]
+
+            for ip, pps, counter in to_block:
+                try:
+                    map_update_blacklist(cfg, ip)
+                    blocked_until[ip] = now + cfg.cooldown_sec
+                    metrics.inc_block_events()
+                    print(
+                        f"[BLOCK] ip={ip} pps={pps:.1f} "
+                        f"counter={counter} unblock_in={cfg.cooldown_sec}s"
+                    )
+                    write_json_log(
+                        log_fd,
+                        "BLOCK",
+                        {
+                            "ip": ip,
+                            "pps": round(pps, 6),
+                            "counter": counter,
+                            "blocked_count": len(blocked_until),
+                            "dt": round(dt, 6),
+                        },
+                    )
+                except RuntimeError as exc:
+                    print(f"[WARN] block failed for {ip}: {exc}", file=sys.stderr)
+
+        # Amnesty: auto-unblock after cooldown.
+        if blocked_until:
+            expired = [ip for ip, ts in blocked_until.items() if now >= ts]
+            for ip in expired:
+                try:
+                    map_delete_blacklist(cfg, ip)
+                    metrics.inc_unblock_events()
+                    print(f"[UNBLOCK] ip={ip} cooldown_expired")
+                    write_json_log(
+                        log_fd,
+                        "UNBLOCK",
+                        {
+                            "ip": ip,
+                            "blocked_count": len(blocked_until) - 1,
+                            "dt": round(dt, 6),
+                        },
+                    )
+                except RuntimeError as exc:
+                    # If key already removed, continue to avoid lock-in.
+                    print(f"[WARN] unblock failed for {ip}: {exc}", file=sys.stderr)
+                finally:
+                    blocked_until.pop(ip, None)
+
+        active_blocked = len(blocked_until)
+        observed = len(curr_counts)
+        
+        if not cfg.no_log_ticks:
+            write_json_log(
+                log_fd,
+                "TICK",
+                {
+                    "observed_ips": observed,
+                    "blocked_count": active_blocked,
+                    "dt": round(dt, 6),
+                },
+            )
+        metrics.update_snapshot(curr_counts, active_blocked)
+
+        if cfg.verbose:
+            print(
+                f"[TICK] observed_ips={observed} blocked_ips={active_blocked} dt={dt:.3f}s"
+            )
+
+        prev_counts = curr_counts
+        prev_ts = now
+        
+        # Sleep in small chunks so we can exit faster on SIGTERM
+        sleep_left = min(cfg.poll_interval, 1.0)
+        while sleep_left > 0 and not shutdown_event.is_set():
+            chunk = min(0.1, sleep_left)
+            time.sleep(chunk)
+            sleep_left -= chunk
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="FluxGuard autonomous DDoS mitigation controller"
+    )
+    p.add_argument("--netns", default="fluxguard", help="Namespace where BPF maps live")
+    p.add_argument(
+        "--meter-map", default="meter_map", help="BPF map name for packet counters"
+    )
+    p.add_argument(
+        "--blacklist-map",
+        default="blacklist_map",
+        help="BPF map name for blocked IPs",
+    )
+    p.add_argument(
+        "--allowlist-map",
+        default="allowlist_map",
+        help="BPF map name for allowed IPs",
+    )
+    p.add_argument(
+        "--pps-threshold",
+        type=float,
+        default=10000.0,
+        help="Packets-per-second threshold per source IP",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.2,
+        help="Polling interval in seconds",
+    )
+    p.add_argument(
+        "--cooldown-sec",
+        type=int,
+        default=900,
+        help="Auto-unblock cooldown in seconds",
+    )
+    p.add_argument(
+        "--block-batch-size",
+        type=int,
+        default=256,
+        help="Max newly blocked IPs per loop (0 means no limit)",
+    )
+    p.add_argument("--verbose", action="store_true", help="Print per-tick status logs")
+    p.add_argument("--no-log-ticks", action="store_true", help="Do not write TICK events to JSON log")
+    p.add_argument(
+        "--log-file",
+        default="/home/samarth/fluxguard/fluxguard.log",
+        help="JSON lines log path (BLOCK/UNBLOCK/TICK)",
+    )
+    p.add_argument(
+        "--metrics-host",
+        default="127.0.0.1",
+        help="Bind address for Prometheus /metrics",
+    )
+    p.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9090,
+        help="TCP port for Prometheus /metrics",
+    )
+    return p
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    cfg = Config(
+        netns=args.netns,
+        meter_map=args.meter_map,
+        blacklist_map=args.blacklist_map,
+        allowlist_map=args.allowlist_map,
+        pps_threshold=args.pps_threshold,
+        poll_interval=args.poll_interval,
+        cooldown_sec=args.cooldown_sec,
+        block_batch_size=args.block_batch_size,
+        verbose=args.verbose,
+        no_log_ticks=args.no_log_ticks,
+        log_file=args.log_file,
+        metrics_host=args.metrics_host,
+        metrics_port=args.metrics_port,
+    )
+
+    metrics = MetricsState()
+    start_metrics_server(metrics, cfg.metrics_host, cfg.metrics_port)
+
+    with open(cfg.log_file, "a", encoding="utf-8") as log_fd:
+        try:
+            monitor(cfg, metrics, log_fd)
+        except RuntimeError as exc:
+            print(f"[FATAL] {exc}", file=sys.stderr)
+            return 1
+            
+    print("\nFluxGuard brain shutdown complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF_BRAIN_P6
+
+chmod +x /home/samarth/fluxguard/fluxguard_brain.py
+
+# Phase 6: Verify maps (just to ensure everything is ready and loaded properly)
+sudo ip netns exec fluxguard bpftool map show | grep -E "blacklist_map|meter_map|allowlist_map"
+
+# Phase 6 TEST: Terminal Window 16 (Phase 6 brain; metrics on loopback :9090)  [Stop with Ctrl+C or SIGTERM]
+sudo python3 /home/samarth/fluxguard/fluxguard_brain.py --netns fluxguard --pps-threshold 1000 --poll-interval 0.2 --cooldown-sec 30 --block-batch-size 256 --verbose --log-file /home/samarth/fluxguard/fluxguard.log
+
+# Phase 6 TEST: Terminal Window 17 (metrics — gauge series fluxguard_meter_packets, not *_total)
+curl -s http://127.0.0.1:9090/metrics | head -40
+
+# Phase 6 TEST: Terminal Window 18 (poll metrics every 2s; no watch(1) required)
+while true; do echo "===="; curl -s http://127.0.0.1:9090/metrics; sleep 2; done
+
+# Phase 6 TEST: Terminal Window 19 (graceful shutdown via SIGTERM from another shell)
+# sudo kill -TERM $(pgrep -f "fluxguard_brain.py")
+
+# Phase 6 TEST (optional): Terminal Window 20 — reduce TICK JSON rate
+# sudo python3 /home/samarth/fluxguard/fluxguard_brain.py --netns fluxguard --no-log-ticks --pps-threshold 1000 --poll-interval 0.2 --cooldown-sec 30 --verbose
+
+# Phase 6 TEST: Terminal Window 21 (allowlist client and flood)
+# Add client to allowlist, then flood. It should NOT be blocked.
+sudo ip netns exec fluxguard bpftool map update name allowlist_map key hex 0a 00 01 01 value hex 01 00 00 00
+sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2
+
+# Phase 6 TEST (optional): Terminal Window 22 (stop flood without Ctrl+C)
+sudo ip netns exec client pkill -f "hping3 --flood" || true
+
+FluxGuard (samarth) — Full Command List (Phase 1 → Phase 6)
+Ubuntu VM username: samarth
+Project directory: /home/samarth/fluxguard
+
+# ==============================================================================

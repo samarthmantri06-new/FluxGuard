@@ -1,0 +1,74 @@
+# Phase 2: Write kernel XDP code file (fluxguard_kern.c)
+cat > /home/samarth/fluxguard/fluxguard_kern.c <<'EOF'
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <bpf/bpf_helpers.h>
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u32);
+    __type(value, __u32);
+} blacklist_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u32);
+} meter_map SEC(".maps");
+
+SEC("xdp")
+int fluxguard_filter(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *iph = data + sizeof(struct ethhdr);
+    if ((void *)(iph + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 src_ip = iph->saddr;
+
+    __u32 *cnt = bpf_map_lookup_elem(&meter_map, &src_ip);
+    if (cnt) {
+        __sync_fetch_and_add(cnt, 1);
+    } else {
+        __u32 init = 1;
+        bpf_map_update_elem(&meter_map, &src_ip, &init, BPF_ANY);
+    }
+
+    __u32 *blocked = bpf_map_lookup_elem(&blacklist_map, &src_ip);
+    if (blocked)
+        return XDP_DROP;
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+EOF
+
+# Phase 2: Compile XDP program
+cd /home/samarth/fluxguard
+clang -O2 -g -Wall -target bpf -c fluxguard_kern.c -o fluxguard_kern.o
+
+# Phase 2: Attach XDP program
+sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpgeneric off
+sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpgeneric obj fluxguard_kern.o sec xdp
+
+# Phase 2: Verify attached + maps exist
+sudo ip netns exec fluxguard ip link show veth-fg-in
+sudo ip netns exec fluxguard bpftool map show | grep -E "blacklist_map|meter_map"
+
+# Phase 2 TEST: Terminal Window 1 (backend http server)  [Stop with Ctrl+C]
+sudo ip netns exec backend python3 -m http.server 80
+
+# Phase 2 TEST: Terminal Window 2 (client curl)
+sudo ip netns exec client curl -I http://10.0.2.2

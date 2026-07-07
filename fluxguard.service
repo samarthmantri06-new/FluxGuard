@@ -1,0 +1,37 @@
+# FluxGuard control-loop (brain) systemd unit.
+#
+# Install:
+#   sudo cp fluxguard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fluxguard.service
+#   sudo systemctl status fluxguard.service
+#
+# PRECONDITION: the XDP program must already be loaded and its maps pinned under
+# /sys/fs/bpf/fluxguard (see the attach + pin steps in the phase runbooks / Makefile).
+# The brain reads those pinned maps; it does not load XDP itself. Runs as root
+# because reading the BPF maps requires privilege.
+
+[Unit]
+Description=FluxGuard XDP/eBPF DDoS mitigation - control loop (brain)
+Documentation=https://github.com/your-username/fluxguard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/samarth/fluxguard
+ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/fluxguard_brain.py \
+    --netns fluxguard \
+    --poll-interval 0.2 \
+    --cooldown-sec 30 \
+    --allowlist-refresh-sec 5 \
+    --log-file /home/samarth/fluxguard/fluxguard.log
+Restart=on-failure
+RestartSec=3
+# Give the loop time to flush its checkpoint on stop
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

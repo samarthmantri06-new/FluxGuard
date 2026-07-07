@@ -1,0 +1,32 @@
+# Phase 5: Reset maps + fresh JSON log
+sudo ip netns exec fluxguard bpftool map deleteall name meter_map
+sudo ip netns exec fluxguard bpftool map deleteall name blacklist_map
+sudo ip netns exec fluxguard bpftool map deleteall name allowlist_map
+: > /home/samarth/fluxguard/fluxguard.log
+
+# Phase 5 TEST: Terminal Window 11 (brain + verbose + metrics)  [Stop with Ctrl+C]
+sudo python3 /home/samarth/fluxguard/fluxguard_brain.py --netns fluxguard --pps-threshold 1000 --poll-interval 0.2 --cooldown-sec 30 --block-batch-size 256 --verbose --log-file /home/samarth/fluxguard/fluxguard.log
+
+# Phase 5 TEST: Terminal Window 12 (curl Prometheus metrics)
+curl -s http://127.0.0.1:9090/metrics
+
+# Phase 5 TEST: Terminal Window 13 (watch metrics ~2s while flooding)
+watch -n 2 curl -s http://127.0.0.1:9090/metrics
+
+# Phase 5 TEST: Terminal Window 14 (JSON log tail)
+tail -f /home/samarth/fluxguard/fluxguard.log
+
+# Phase 5 TEST (optional): Terminal Window 15 (stop flood without Ctrl+C)
+sudo ip netns exec client pkill -f "hping3 --flood" || true
+
+# Phase 5: Verify maps (meter_map, blacklist_map, allowlist_map)
+sudo ip netns exec fluxguard bpftool --json map dump name meter_map
+sudo ip netns exec fluxguard bpftool --json map dump name blacklist_map
+sudo ip netns exec fluxguard bpftool --json map dump name allowlist_map
+
+# Cleanup (run when finished)
+sudo ip netns del client
+sudo ip netns del fluxguard
+sudo ip netns del backend
+
+# ==============================================================================

@@ -1,0 +1,603 @@
+# ==============================================================================
+# Phase 10: Proactive Kernel Mitigation (In-Kernel Blacklist & Global Drops)
+#           Map LRU Eviction & BPF Ring Buffer Dashboard
+# ==============================================================================
+
+# Phase 10: Write updated XDP kernel program (fluxguard_kern.c)
+cat > /home/samarth/fluxguard/fluxguard_kern.c <<'EOF_KERN_P10'
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <bpf/bpf_helpers.h>
+
+#define MAX_ENTRIES 65536
+#define KERN_PPS_LIMIT 10000LL
+#define GLOBAL_PPS_LIMIT 500000LL
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u32);
+} blacklist_map SEC(".maps");
+
+/* Fix C: meter_map converted to LRU_HASH */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, __u32);
+    __type(value, __u32);
+} meter_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u32);
+} allowlist_map SEC(".maps");
+
+struct token_bucket {
+    __u64 last_time;
+    __s64 tokens;
+};
+
+/* Fix B: Global token bucket map */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct token_bucket);
+} global_rate_map SEC(".maps");
+
+/* New Feature: Ring buffer for Attack Logs */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); /* 256KB */
+} event_ringbuf SEC(".maps");
+
+/* Fix C: rate_map converted to LRU_HASH */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, __u32);
+    __type(value, struct token_bucket);
+} rate_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u8);
+    __type(value, __u32);
+} proto_filter_map SEC(".maps");
+
+struct attack_event {
+    __u32 ip;
+    __u32 reason;
+    __u64 timestamp;
+};
+
+SEC("xdp")
+int fluxguard_filter(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *iph = data + sizeof(struct ethhdr);
+    if ((void *)(iph + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 src_ip = iph->saddr;
+    __u8 protocol = iph->protocol;
+    __u64 now = bpf_ktime_get_ns();
+
+    /* 1. Allowlist - always bypass everything if allowlisted */
+    __u32 *allowed = bpf_map_lookup_elem(&allowlist_map, &src_ip);
+    if (allowed)
+        return XDP_PASS;
+
+    /* 2. Global Rate Tracking / Shields Up (Fix B) */
+    __u32 zero = 0;
+    struct token_bucket *gtb = bpf_map_lookup_elem(&global_rate_map, &zero);
+    if (gtb) {
+        __u64 g_elapsed = now - gtb->last_time;
+        /* Refill roughly 10 times a second */
+        if (g_elapsed > 100000000ULL) {
+            __s64 refill = (g_elapsed / 1000000ULL) * (GLOBAL_PPS_LIMIT / 1000LL);
+            gtb->last_time = now;
+            __s64 new_tokens = gtb->tokens + refill;
+            if (new_tokens > GLOBAL_PPS_LIMIT) {
+                new_tokens = GLOBAL_PPS_LIMIT;
+            }
+            gtb->tokens = new_tokens;
+        }
+        
+        __s64 tokens_left = __sync_fetch_and_sub(&gtb->tokens, 1);
+        if (tokens_left <= 0) {
+            /* Shields Up active! Dropping unconditionally. */
+            if (tokens_left < -100000LL) {
+                gtb->tokens = -100000LL; /* Cap underflow when under huge flood */
+            }
+            return XDP_DROP;
+        }
+    }
+
+    /* 3. Protocol filter check */
+    __u32 *proto_action = bpf_map_lookup_elem(&proto_filter_map, &protocol);
+    if (proto_action && *proto_action == 1) {
+        return XDP_DROP;
+    }
+
+    /* 4. Update meter_map (LRU Hash to prevent exhaustion - Fix C) */
+    __u32 *cnt = bpf_map_lookup_elem(&meter_map, &src_ip);
+    if (cnt) {
+        __sync_fetch_and_add(cnt, 1);
+    } else {
+        __u32 init = 1;
+        bpf_map_update_elem(&meter_map, &src_ip, &init, BPF_ANY);
+    }
+
+    /* 5. Check blacklist */
+    __u32 *blocked = bpf_map_lookup_elem(&blacklist_map, &src_ip);
+    if (blocked)
+        return XDP_DROP;
+
+    /* 6. In-kernel per-IP rate limiting & Auto-Blacklist (Fix A & C) */
+    struct token_bucket *tb = bpf_map_lookup_elem(&rate_map, &src_ip);
+    if (tb) {
+        __u64 elapsed_ns = now - tb->last_time;
+        if (elapsed_ns > 1000000ULL) { 
+            __s64 refill = (elapsed_ns * KERN_PPS_LIMIT) / 1000000000ULL;
+            if (refill > 0) {
+                tb->last_time = now;
+                tb->tokens += refill;
+                if (tb->tokens > KERN_PPS_LIMIT) tb->tokens = KERN_PPS_LIMIT;
+            }
+        }
+        
+        tb->tokens -= 1;
+        if (tb->tokens < 0) {
+            /* Fix A: Auto-Blacklist implemented purely in C! */
+            __u32 blocked_val = 1;
+            bpf_map_update_elem(&blacklist_map, &src_ip, &blocked_val, BPF_ANY);
+            
+            /* RingBuf Logger: Send a live event to Dashboard */
+            struct attack_event *e = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*e), 0);
+            if (e) {
+                e->ip = src_ip;
+                e->reason = 1; /* 1 = KERNEL_AUTO_BLOCK */
+                e->timestamp = now;
+                bpf_ringbuf_submit(e, 0);
+            }
+            return XDP_DROP;
+        }
+    } else {
+        struct token_bucket new_tb = {0};
+        new_tb.last_time = now;
+        new_tb.tokens = KERN_PPS_LIMIT - 1;
+        bpf_map_update_elem(&rate_map, &src_ip, &new_tb, BPF_ANY);
+    }
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+EOF_KERN_P10
+
+# Phase 10: Compile XDP program
+cd /home/samarth/fluxguard
+clang -O2 -g -Wall -target bpf -c fluxguard_kern.c -o fluxguard_kern.o
+
+# Phase 10: Write updated Python Brain
+cat > /home/samarth/fluxguard/fluxguard_brain.py <<'EOF_BRAIN_P10'
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import ctypes
+import datetime
+import ipaddress
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple, TextIO, Set
+
+from fluxguard_metrics import MetricsState, start_metrics_server
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+class bpf_attr(ctypes.Union):
+    class map_elem(ctypes.Structure):
+        _fields_ = [
+            ("map_fd", ctypes.c_uint32),
+            ("key", ctypes.c_uint64),
+            ("value", ctypes.c_uint64),
+            ("flags", ctypes.c_uint64),
+        ]
+    class obj_get(ctypes.Structure):
+        _fields_ = [
+            ("pathname", ctypes.c_uint64),
+            ("bpf_fd", ctypes.c_uint32),
+            ("file_flags", ctypes.c_uint32),
+        ]
+    _fields_ = [("elem", map_elem), ("obj_get", obj_get)]
+
+def bpf_syscall(cmd: int, attr: bpf_attr) -> int:
+    res = libc.syscall(321, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
+    if res < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return res
+
+def bpf_obj_get(path: str) -> int:
+    attr = bpf_attr()
+    attr.obj_get.pathname = ctypes.cast(ctypes.c_char_p(path.encode()), ctypes.c_void_p).value
+    return bpf_syscall(7, attr)
+
+class BpfKey(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_uint8 * 4)]
+
+class BpfValue(ctypes.Structure):
+    _fields_ = [("val", ctypes.c_uint32)]
+
+class ProtoKey(ctypes.Structure):
+    _fields_ = [("val", ctypes.c_uint8)]
+
+def key_to_ip(k: BpfKey) -> str:
+    return str(ipaddress.IPv4Address(bytes(k.bytes)))
+
+def ip_to_key(ip_str: str) -> BpfKey:
+    k = BpfKey()
+    k.bytes = (ctypes.c_uint8 * 4)(*ipaddress.IPv4Address(ip_str).packed)
+    return k
+
+def get_global_tokens(fd: int) -> int:
+    class TokenBucket(ctypes.Structure):
+        _fields_ = [("last_time", ctypes.c_uint64), ("tokens", ctypes.c_int64)]
+    k = BpfValue()
+    k.val = 0
+    v = TokenBucket()
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    try:
+        bpf_syscall(1, attr)
+        return v.tokens
+    except OSError:
+        return 0
+
+def dump_map_u32(fd: int) -> Dict[str, int]:
+    res = {}
+    first_key = BpfKey()
+    current_key = BpfKey()
+    next_key = BpfKey()
+    value = BpfValue()
+    
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = 0
+    attr.elem.value = ctypes.addressof(first_key)
+    
+    try:
+        bpf_syscall(4, attr)
+    except OSError as e:
+        if e.errno == 2:
+            return res
+        raise
+        
+    ctypes.memmove(ctypes.addressof(current_key), ctypes.addressof(first_key), ctypes.sizeof(BpfKey))
+
+    while True:
+        attr_lookup = bpf_attr()
+        attr_lookup.elem.map_fd = fd
+        attr_lookup.elem.key = ctypes.addressof(current_key)
+        attr_lookup.elem.value = ctypes.addressof(value)
+        try:
+            bpf_syscall(1, attr_lookup)
+            res[key_to_ip(current_key)] = value.val
+        except OSError:
+            pass
+            
+        attr_next = bpf_attr()
+        attr_next.elem.map_fd = fd
+        attr_next.elem.key = ctypes.addressof(current_key)
+        attr_next.elem.value = ctypes.addressof(next_key)
+        try:
+            bpf_syscall(4, attr_next)
+            ctypes.memmove(ctypes.addressof(current_key), ctypes.addressof(next_key), ctypes.sizeof(BpfKey))
+        except OSError as e:
+            break
+            
+    return res
+
+def set_map_u32(fd: int, ip_str: str, val: int) -> None:
+    k = ip_to_key(ip_str)
+    v = BpfValue()
+    v.val = val
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    attr.elem.flags = 0
+    bpf_syscall(2, attr)
+
+def del_map_u32(fd: int, ip_str: str) -> None:
+    k = ip_to_key(ip_str)
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    bpf_syscall(3, attr)
+
+def set_proto_filter(fd: int, proto: int, action: int) -> None:
+    k = ProtoKey()
+    k.val = proto
+    v = BpfValue()
+    v.val = action
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    attr.elem.flags = 0
+    bpf_syscall(2, attr)
+
+shutdown_event = threading.Event()
+
+def handle_sigterm(signum: int, frame: Any) -> None:
+    shutdown_event.set()
+
+def write_json_log(fd: TextIO, event: str, fields: Dict[str, Any]) -> None:
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    record: Dict[str, Any] = {"timestamp": ts, "event": event}
+    record.update(fields)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    fd.write(line)
+    fd.flush()
+
+def monitor(args: argparse.Namespace, metrics: MetricsState, log_fd: TextIO) -> None:
+    base = f"/sys/fs/bpf/{args.netns}"
+    meter_fd = bpf_obj_get(f"{base}/meter_map")
+    blacklist_fd = bpf_obj_get(f"{base}/blacklist_map")
+    allowlist_fd = bpf_obj_get(f"{base}/allowlist_map")
+    proto_fd = bpf_obj_get(f"{base}/proto_filter_map")
+    global_rate_fd = bpf_obj_get(f"{base}/global_rate_map")
+
+    if args.drop_proto is not None:
+        set_proto_filter(proto_fd, args.drop_proto, 1)
+        print(f"Set protocol filter rule: drop protocol {args.drop_proto}")
+
+    print(f"Phase 10 Brain Analytics started. Polling maps to log autonomous kernel decisions...")
+    
+    prev_ts = time.monotonic()
+    blocked_until: Dict[str, float] = {}
+    allowlist_cache: Dict[str, int] = {}
+    allowlist_ts = 0.0
+    prev_global_tokens = 0
+    
+    while not shutdown_event.is_set():
+        now = time.monotonic()
+        dt = now - prev_ts
+        if dt <= 0:
+            dt = args.poll_interval
+
+        if now - allowlist_ts >= 30.0:
+            try:
+                allowlist_cache = dump_map_u32(allowlist_fd)
+                allowlist_ts = now
+            except OSError:
+                pass
+
+        curr_blacklist = {}
+        curr_counts = {}
+        global_tokens = 0
+        try:
+            curr_blacklist = dump_map_u32(blacklist_fd)
+            curr_counts = dump_map_u32(meter_fd)
+            global_tokens = get_global_tokens(global_rate_fd)
+        except OSError as exc:
+            pass
+
+        if global_tokens <= 0 and global_tokens < prev_global_tokens:
+            metrics.inc_global_pps_exceeded()
+            print(f"[SHIELDS UP DETECTED] Global Token Bucket exhausted by Kernel!")
+            write_json_log(log_fd, "SHIELDS_UP", {"global_tokens": global_tokens})
+
+        # Notice autonomous kernel blocks and sync them to python cooldown states!
+        for ip in curr_blacklist:
+            if ip not in blocked_until:
+                blocked_until[ip] = now + args.cooldown_sec
+                metrics.inc_block_events()
+                print(f"[KERNEL AUTO-BLOCK DETECTED] ip={ip} unblock_in={args.cooldown_sec}s")
+                write_json_log(log_fd, "AUTO_BLOCK", {"ip": ip, "blocked_count": len(blocked_until) + 1})
+
+        # Slowly unblock IPs gracefully afterwards
+        if blocked_until:
+            expired = [ip for ip, ts in blocked_until.items() if now >= ts]
+            for ip in expired:
+                try:
+                    del_map_u32(blacklist_fd, ip)
+                    metrics.inc_unblock_events()
+                    print(f"[UNBLOCK] ip={ip} cooldown_expired")
+                    write_json_log(log_fd, "UNBLOCK", {"ip": ip, "blocked_count": len(blocked_until) - 1})
+                except OSError:
+                    pass
+                finally:
+                    blocked_until.pop(ip, None)
+
+        metrics.update_blocked_set(set(blocked_until.keys()))
+        metrics.update_snapshot(curr_counts, len(blocked_until))
+
+        if args.verbose:
+            print(f"[TICK] ips={len(curr_counts)} blocked={len(blocked_until)} dt={dt:.3f}s")
+
+        prev_global_tokens = global_tokens
+        prev_ts = now
+        
+        sleep_left = min(args.poll_interval, 1.0)
+        while sleep_left > 0 and not shutdown_event.is_set():
+            chunk = min(0.1, sleep_left)
+            time.sleep(chunk)
+            sleep_left -= chunk
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--netns", default="fluxguard")
+    p.add_argument("--poll-interval", type=float, default=0.2)
+    p.add_argument("--cooldown-sec", type=int, default=30)
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--no-log-ticks", action="store_true")
+    p.add_argument("--log-file", default="/home/samarth/fluxguard/fluxguard.log")
+    p.add_argument("--metrics-host", default="127.0.0.1")
+    p.add_argument("--metrics-port", type=int, default=9090)
+    p.add_argument("--drop-proto", type=int, help="Protocol ID to drop")
+    args = p.parse_args()
+
+    metrics = MetricsState()
+    start_metrics_server(metrics, args.metrics_host, args.metrics_port)
+
+    with open(args.log_file, "a", encoding="utf-8") as log_fd:
+        try:
+            monitor(args, metrics, log_fd)
+        except Exception as exc:
+            print(f"[FATAL] {exc}", file=sys.stderr)
+            return 1
+            
+    print("\nFluxGuard brain shutdown complete.")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF_BRAIN_P10
+chmod +x /home/samarth/fluxguard/fluxguard_brain.py
+
+# Phase 10: Write updated Dashboard
+cat > /home/samarth/fluxguard/fluxguard_dashboard.py <<'EOF_DASH_P10'
+#!/usr/bin/env python3
+import os
+import sys
+import mmap
+import struct
+import time
+import socket
+import ipaddress
+import signal
+from fluxguard_brain import bpf_obj_get
+
+def listen_ringbuf(map_path="/sys/fs/bpf/fluxguard/event_ringbuf"):
+    print("\033[2J\033[H", end="")
+    print("=== FluxGuard Live Dashboard (Autonomous Kernel Block Logger) ===")
+    print(f"{'TIMESTAMP':<25} | {'SOURCE IP':<18} | {'REASON':<20}")
+    print("-" * 68)
+
+    PAGE_SIZE = 4096
+    RB_SIZE = 256 * PAGE_SIZE
+    
+    try:
+        fd = bpf_obj_get(map_path)
+    except Exception as e:
+        print(f"Error: Could not access {map_path}. Is the map loaded? {e}")
+        return
+
+    try:
+        # BPF ringbuf allows mapping 2*RB_SIZE to handle wrap-around seamlessly
+        buf = mmap.mmap(fd, 2 * PAGE_SIZE + 2 * RB_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    except Exception as e:
+        # Fallback to normal sizing if the above fails
+        try:
+            buf = mmap.mmap(fd, 2 * PAGE_SIZE + RB_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        except Exception as e:
+            print(f"Error mmaping ringbuf: {e}")
+            return
+
+    data_off = 2 * PAGE_SIZE
+    
+    while True:
+        cons = struct.unpack_from("<Q", buf, 0)[0]
+        prod = struct.unpack_from("<Q", buf, PAGE_SIZE)[0]
+        
+        while cons < prod:
+            pos = cons & (RB_SIZE - 1)
+            hdr_len = struct.unpack_from("<I", buf, data_off + pos)[0]
+            
+            # Check if this record is valid 
+            if (hdr_len & 0xC0000000) == 0:
+                # payload is offset by 8 bytes from header
+                ip_bytes = buf[data_off + pos + 8 : data_off + pos + 12]
+                ip_str = str(ipaddress.IPv4Address(bytes(ip_bytes)))
+                reason_val, ts_val = struct.unpack_from("<IQ", buf, data_off + pos + 12)
+                
+                reason_str = "AUTO_BLOCKED" if reason_val == 1 else f"REASON_{reason_val}"
+                
+                from datetime import datetime
+                ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                
+                print(f"[{ts_str}] | \033[31m{ip_str:<18}\033[0m | {reason_str}")
+            
+            # Record sizes are 8-byte aligned
+            total_len = (hdr_len & 0x0FFFFFFF) + 8
+            total_len = (total_len + 7) & ~7
+            cons += total_len
+            
+            # Update consumer pointer
+            struct.pack_into("<Q", buf, 0, cons)
+            
+        time.sleep(0.02)
+
+def handle_sigterm(s, f):
+    print("\033[0m\nExiting.")
+    sys.exit(0)
+
+def main():
+    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    listen_ringbuf()
+
+if __name__ == "__main__":
+    main()
+EOF_DASH_P10
+chmod +x /home/samarth/fluxguard/fluxguard_dashboard.py
+
+# Phase 10: Reset maps for tests
+sudo ip netns exec fluxguard ip link set dev veth-fg-in xdp off 2>/dev/null || true
+sudo rm -rf /sys/fs/bpf/fluxguard/*
+if sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpdrv obj fluxguard_kern.o sec xdp 2>/dev/null; then
+    echo "Reloaded natively"
+else
+    sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpgeneric obj fluxguard_kern.o sec xdp
+fi
+for map in meter_map blacklist_map allowlist_map rate_map global_rate_map proto_filter_map event_ringbuf; do
+    ID=$(sudo ip netns exec fluxguard bpftool map | grep -w $map | head -1 | awk '{print $1}' | tr -d ':')
+    if [ -n "$ID" ]; then
+        sudo ip netns exec fluxguard bpftool map pin id $ID /sys/fs/bpf/fluxguard/$map
+    fi
+done
+
+# Phase 10 TEST: Window 38 (The Crash Test)
+# 1. Start Phase 10 Brain
+# sudo python3 /home/samarth/fluxguard/fluxguard_brain.py &
+# 2. Wait, then kill the Brain
+# sleep 5 && sudo pkill -9 -f fluxguard_brain.py
+# 3. Start a flood from the client
+# sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2
+# 4. In another window, check tcpdump to see backend is protected
+# sudo ip netns exec backend tcpdump -i veth-backend -n tcp port 80
+
+# Phase 10 TEST: Window 39 (The Map Fill Test)
+# Run an IP spoofing flood
+# sudo ip netns exec client hping3 --flood --rand-source -S -p 80 10.0.2.2
+# Verify meter_map does not lock up due to LRU hash eviction (watch new entries populate)
+# sudo ip netns exec fluxguard bpftool map dump pinned /sys/fs/bpf/fluxguard/meter_map | head -n 20
+
+# Phase 10 TEST: Window 40 (The Ring Buffer Log)
+# Stream live autonomous kernel blocking decisions
+# sudo python3 /home/samarth/fluxguard/fluxguard_dashboard.py

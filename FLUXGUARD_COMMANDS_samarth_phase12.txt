@@ -1,0 +1,114 @@
+# =============================================================================
+# FluxGuard Phase 12 – Production Deployment on a Real Ubuntu Host
+# =============================================================================
+# This script contains the step‑by‑step commands you need to run on a bare‑metal Ubuntu
+# system (or a cloud VM) to move FluxGuard from the VirtualBox lab to a production
+# environment.  All paths assume the project lives in $HOME/fluxguard.
+# =============================================================================
+
+# 1️⃣ Install system dependencies (run as root or with sudo)
+sudo apt update && sudo apt install -y \
+    clang llvm libelf-dev libbpf-dev gcc iproute2 iputils-ping hping3 python3-pip python3-venv git
+
+# 2️⃣ Copy project files to the host (if not already there)
+# Example using scp from Windows – adjust paths as needed:
+# scp -r "d:/Education/second year/OS/project/*" samarth@<HOST>:/home/samarth/fluxguard/
+cd $HOME/fluxguard
+
+# 3️⃣ Build the XDP kernel program (Phase‑12 includes optional SYN‑cookie support)
+clang -O2 -target bpf -c fluxguard_kern.c -o fluxguard_kern.o
+# Verify with bpftool (optional)
+# sudo bpftool prog load fluxguard_kern.o /sys/fs/bpf/fluxguard/fluxguard_prog
+
+# 4️⃣ Identify the real NIC you want to protect (e.g. eth0)
+IFACE=$(ip link | awk -F': ' '/^[0-9]+: / && $2 != "lo" {print $2; exit}')
+
+echo "Attaching XDP program to $IFACE (native driver mode)..."
+# Native driver mode (fast) – works on modern NICs (mlx5, i40e, etc.)
+sudo ip link set dev $IFACE xdpdrv obj $HOME/fluxguard/fluxguard_kern.o sec .text
+# If the NIC doesn't support xdpdrv, fall back to generic mode:
+# sudo ip link set dev $IFACE xdpgeneric obj $HOME/fluxguard/fluxguard_kern.o sec .text
+
+# 5️⃣ Pin all BPF maps (required for the userspace tools)
+mkdir -p /sys/fs/bpf/fluxguard
+for MAP in meter_map blacklist_map allowlist_map rate_map \
+           meter_map_v6 blacklist_map_v6 allowlist_map_v6 rate_map_v6 \
+           global_counter_map global_rate_map proto_filter_map event_ringbuf; do
+    ID=$(sudo bpftool map show | grep -w "$MAP" | head -1 | awk '{print $1}' | tr -d ':')
+    if [ -n "$ID" ]; then
+        sudo bpftool map pin id "$ID" /sys/fs/bpf/fluxguard/$MAP
+        echo "Pinned $MAP"
+    else
+        echo "[WARN] Map $MAP not found – check kernel load"
+    fi
+done
+
+# 6️⃣ Create a Python virtual environment and install Python deps
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt   # contains prometheus_client, flask, toml
+
+# 7️⃣ Deploy configuration (JSON‑backed).  Edit /etc/fluxguard/config.toml as needed.
+sudo mkdir -p /etc/fluxguard
+cat > /etc/fluxguard/config.toml <<'EOF'
+[general]
+interface = "$IFACE"
+log_file = "/var/log/fluxguard.log"
+persistence = "/var/lib/fluxguard/blocked_ips.json"
+
+[limits]
+pps_limit_v4 = 500000
+pps_limit_v6 = 500000
+global_pps_limit = 1000000
+
+[api]
+bind = "127.0.0.1"
+port = 8080
+EOF
+sudo chown -R samarth:samarth /etc/fluxguard
+
+# 8️⃣ Install systemd service for the brain
+sudo cp fluxguard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fluxguard.service
+sudo systemctl status fluxguard.service   # should be active (running)
+
+# 9️⃣ (Optional) Install the REST API as a second service
+cat > /etc/systemd/system/fluxguard-api.service <<'EOF'
+[Unit]
+Description=FluxGuard REST API
+After=network.target fluxguard.service
+
+[Service]
+Type=simple
+User=samarth
+WorkingDirectory=$HOME/fluxguard
+ExecStart=$HOME/fluxguard/venv/bin/python $HOME/fluxguard/fluxguard_api.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now fluxguard-api.service
+
+# 10️⃣ Verify Prometheus metrics endpoint
+curl http://127.0.0.1:9090/metrics | head -n 20
+
+# 11️⃣ Quick sanity test – normal traffic should pass
+sudo hping3 -c 10 -i u1000 -S -p 80 10.0.2.2
+# Flood test – should trigger auto‑block and appear in logs / dashboard
+sudo hping3 --flood --rand-source -S -p 80 10.0.2.2 &
+sleep 3
+sudo pkill -f hping3 || true
+
+# 12️⃣ Cleanup (if you ever need to stop the service)
+sudo systemctl stop fluxguard.service
+sudo systemctl stop fluxguard-api.service
+sudo ip link set dev $IFACE xdp off
+sudo rm -rf /sys/fs/bpf/fluxguard
+
+# =============================================================================
+# End of Phase 12 deployment script.
+# =============================================================================

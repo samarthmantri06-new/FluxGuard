@@ -1,0 +1,219 @@
+# ==============================================================================
+# Phase 11: Full Hardening — Token Bucket Fix, IPv6 Support, Persistence,
+#            Shared BPF Module, Decoupled CLI, Corrected Dump Utility
+# ==============================================================================
+# Project: FluxGuard | User: samarth | Dir: /home/samarth/fluxguard
+# Run all commands in Ubuntu VM (Oracle VirtualBox) as sudo where indicated.
+# ==============================================================================
+
+# --- Step 1: Copy all Phase 11 Python files to VM ---
+# (Run these from your Windows host if using shared folder, or scp them in)
+# The files to deploy:
+#   fluxguard_bpf.py         <- NEW: shared BPF syscall interface module
+#   fluxguard_brain.py       <- UPDATED: uses fluxguard_bpf, persistence, IPv6
+#   fluxguard_metrics.py     <- UPDATED: IPv6 + blocked_ip gauge + shields-up
+#   fluxguard_allow.py       <- UPDATED: decoupled from brain, IPv6 aware
+#   fluxguard_dashboard.py   <- UPDATED: safe ring buffer, combined display
+#   fluxguard_kern.c         <- UPDATED: token bucket fix + IPv6 XDP pipeline
+#   some.py                  <- FIXED: self-exclusion bug resolved
+
+# --- Step 2: Mount BPF filesystem (if not already mounted) ---
+sudo mount -t bpf none /sys/fs/bpf/ 2>/dev/null || true
+sudo ip netns exec fluxguard mount -t bpf none /sys/fs/bpf/ 2>/dev/null || true
+sudo mkdir -p /sys/fs/bpf/fluxguard
+
+# --- Step 3: Compile Phase 11 XDP kernel program ---
+cd /home/samarth/fluxguard
+clang -O2 -g -Wall -target bpf \
+    -I/usr/include/$(uname -m)-linux-gnu \
+    -c fluxguard_kern.c -o fluxguard_kern.o
+
+# Verify the object loaded and inspect its sections
+llvm-objdump -h fluxguard_kern.o | grep -E "maps|xdp"
+
+# --- Step 4: Reload XDP program (generic mode for VirtualBox VMs) ---
+sudo ip netns exec fluxguard ip link set dev veth-fg-in xdp off 2>/dev/null || true
+sudo rm -rf /sys/fs/bpf/fluxguard/*
+
+# Try native driver mode first, fall back to generic (VirtualBox always uses generic)
+if sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpdrv obj fluxguard_kern.o sec xdp 2>/dev/null; then
+    echo "[INFO] XDP loaded in NATIVE (xdpdrv) mode"
+else
+    echo "[INFO] Falling back to GENERIC (xdpgeneric) mode — normal for VirtualBox"
+    sudo ip netns exec fluxguard ip link set dev veth-fg-in xdpgeneric obj fluxguard_kern.o sec xdp
+fi
+
+# Confirm XDP is attached
+sudo ip netns exec fluxguard ip link show veth-fg-in | grep -i xdp
+
+# --- Step 5: Pin ALL maps (IPv4 + IPv6 + shared) ---
+# Phase 11 has 11 maps total — pin each one
+for map in \
+    meter_map blacklist_map allowlist_map rate_map \
+    meter_map_v6 blacklist_map_v6 allowlist_map_v6 rate_map_v6 \
+    global_counter_map global_rate_map proto_filter_map event_ringbuf; do
+
+    ID=$(sudo ip netns exec fluxguard bpftool map show | grep -w "$map" | head -1 | awk '{print $1}' | tr -d ':')
+    if [ -n "$ID" ]; then
+        sudo ip netns exec fluxguard bpftool map pin id "$ID" /sys/fs/bpf/fluxguard/"$map"
+        echo "[PIN] $map -> /sys/fs/bpf/fluxguard/$map (id=$ID)"
+    else
+        echo "[WARN] Map not found: $map"
+    fi
+done
+
+# Verify all maps are pinned
+ls -la /sys/fs/bpf/fluxguard/
+
+# --- Step 6: Verify kernel architecture and BPF syscall ID ---
+uname -m
+# Expected: x86_64 -> SYS_BPF=321 (auto-detected by fluxguard_bpf.py)
+
+# Verify CPU count (affects PERCPU_ARRAY read buffer sizing in fluxguard_bpf.py)
+nproc
+# The brain will use os.cpu_count() dynamically — no hardcoding
+
+# ==============================================================================
+# Phase 11 TEST PLAN
+# ==============================================================================
+
+# --- TEST 1: Terminal Window A — Launch Phase 11 Brain ---
+sudo python3 /home/samarth/fluxguard/fluxguard_brain.py \
+    --netns fluxguard \
+    --poll-interval 0.2 \
+    --cooldown-sec 30 \
+    --allowlist-refresh-sec 5 \
+    --verbose \
+    --log-file /home/samarth/fluxguard/fluxguard.log
+
+# Expected output:
+#   Loaded N blocks from persistence checkpoint.
+#   IPv6 support enabled: detected v6 maps.
+#   Phase 11 Brain started. Cooldown=30s. Allowlist refresh=5.0s.
+
+# --- TEST 2: Terminal Window B — Normal Traffic (should PASS) ---
+sudo ip netns exec client ping -c 4 10.0.2.2
+# All 4 pings should succeed (normal IPv4 traffic)
+
+# --- TEST 3: Terminal Window C — IPv4 Flood (auto-block) ---
+sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2
+# Expected: kernel auto-blocks within ~1s (1000 pps limit)
+# Watch Terminal A for: [KERNEL AUTO-BLOCK DETECTED] ip=10.0.1.1 (IPv4)
+
+# --- TEST 4: Terminal Window D — Verify backend is protected during flood ---
+sudo ip netns exec backend tcpdump -i veth-backend -n tcp port 80
+# Should show: ~zero packets reaching backend after auto-block triggers
+
+# --- TEST 5: Terminal Window E — Test token bucket precision ---
+# Rate-controlled flood at exactly 900 pps (below 1000 pps limit — should PASS)
+sudo ip netns exec client hping3 --rate 900 -S -p 80 -c 1000 10.0.2.2
+# All 1000 packets should pass through
+
+# Rate at 1100 pps (above 1000 pps limit — should trigger block)
+sudo ip netns exec client hping3 --rate 1100 -S -p 80 -c 500 10.0.2.2
+# Should trigger auto-block and LOG event in ring buffer
+
+# --- TEST 6: Terminal Window F — Launch Live Dashboard ---
+sudo python3 /home/samarth/fluxguard/fluxguard_dashboard.py \
+    --metrics-url http://127.0.0.1:9090/metrics \
+    --ringbuf-path /sys/fs/bpf/fluxguard/event_ringbuf \
+    --refresh 2.0
+
+# Expected: color terminal with packet counts, blocked IPs, ring buffer events
+
+# --- TEST 7: Terminal Window G — IPv6 Traffic Test ---
+# Send IPv6 ping through namespace (requires IPv6 addressing on veth pairs)
+sudo ip netns exec fluxguard ip -6 addr show
+sudo ip netns exec client ping6 -c 4 <fluxguard_v6_addr>
+# Should PASS (normal IPv6 traffic metered in meter_map_v6)
+
+# IPv6 flood test
+sudo ip netns exec client hping3 --flood -6 -S -p 80 <backend_v6_addr> 2>/dev/null || \
+    echo "hping3 IPv6 not available; use scapy or ip6tables test"
+
+# --- TEST 8: Terminal Window H — Persistence Test ---
+# 1. Block an IP
+sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2 &
+sleep 2; sudo pkill hping3
+
+# 2. Verify blocked_ips.json was written
+cat /home/samarth/fluxguard/blocked_ips.json
+# Expected: {"10.0.1.1": <unblock_timestamp>}
+
+# 3. Kill the brain
+sudo pkill -TERM -f fluxguard_brain.py
+
+# 4. Restart brain — should reload blocked IPs from checkpoint
+sudo python3 /home/samarth/fluxguard/fluxguard_brain.py \
+    --netns fluxguard --cooldown-sec 30 --verbose \
+    --log-file /home/samarth/fluxguard/fluxguard.log
+# Expected: "Loaded 1 blocks from persistence checkpoint."
+
+# --- TEST 9: Terminal Window I — Allowlist Management ---
+# Add IPv4 to allowlist
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py add 10.0.1.5
+# Expected: [ALLOW] Added IPv4 10.0.1.5
+
+# List allowlist
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py list
+# Expected: IPv4 allowlist: \n  10.0.1.5
+
+# Remove from allowlist
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py del 10.0.1.5
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py list
+# Expected: IPv4 allowlist: (empty)
+
+# --- TEST 10: Terminal Window J — Allowlist Refresh Speed ---
+# Brain must be running (TEST 1)
+# 1. Add IP while brain is running
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py add 10.0.1.5
+# 2. Wait <= 5 seconds (--allowlist-refresh-sec=5)
+sleep 6
+# 3. Flood from that IP — should NOT be blocked
+sudo ip netns exec client hping3 --flood -S -p 80 -a 10.0.1.5 10.0.2.2 &
+sleep 2; sudo pkill hping3
+# 4. Verify backend still received packets (IP was allowlisted)
+sudo ip netns exec backend tcpdump -i veth-backend -n -c 20 tcp port 80
+
+# --- TEST 11: Terminal Window K — Protocol Filter ---
+# Drop all UDP (proto=17) traffic
+sudo python3 -c "
+import sys; sys.path.insert(0, '/home/samarth/fluxguard')
+from fluxguard_bpf import bpf_obj_get, set_proto_filter
+fd = bpf_obj_get('/sys/fs/bpf/fluxguard/proto_filter_map')
+set_proto_filter(fd, 17, 1)
+print('UDP drop rule applied')
+"
+
+# Test UDP is now dropped (hping3 --udp)
+sudo ip netns exec client hping3 --udp -p 53 -c 5 10.0.2.2
+# Expected: all 5 packets dropped (no response)
+
+# --- TEST 12: Terminal Window L — Prometheus Metrics Verification ---
+curl -s http://127.0.0.1:9090/metrics | grep -E "blocked_ip|shields|global"
+# Expected metrics present:
+#   fluxguard_blocked_ip{ip="..."} 1
+#   fluxguard_global_pps_exceeded_total N
+#   fluxguard_blocked_ips N
+
+# --- TEST 13: Global Shields-Up Test ---
+# Simultaneous multi-source flood to hit global 500k pps limit
+sudo ip netns exec client hping3 --flood --rand-source -S -p 80 10.0.2.2
+# Watch Terminal A for: [SHIELDS UP DETECTED] Global Token Bucket exhausted
+# Stop flood
+sudo ip netns exec client pkill -f hping3 || true
+
+# --- Cleanup ---
+sudo ip netns exec fluxguard ip link set dev veth-fg-in xdp off 2>/dev/null || true
+sudo pkill -TERM -f fluxguard_brain.py || true
+sudo pkill -TERM -f fluxguard_dashboard.py || true
+
+# ==============================================================================
+# FluxGuard (samarth) — Phase 11 Summary
+# Ubuntu VM username: samarth
+# Project directory:  /home/samarth/fluxguard
+# Maps pinned at:     /sys/fs/bpf/fluxguard/
+# Persistence file:   /home/samarth/fluxguard/blocked_ips.json
+# Log file:           /home/samarth/fluxguard/fluxguard.log
+# Metrics endpoint:   http://127.0.0.1:9090/metrics
+# ==============================================================================

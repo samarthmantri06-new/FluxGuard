@@ -1,0 +1,18 @@
+# Phase 3: Manual block test reset maps
+sudo ip netns exec fluxguard bpftool map deleteall name meter_map
+sudo ip netns exec fluxguard bpftool map deleteall name blacklist_map
+
+# Phase 3: Manually block client 10.0.1.1
+sudo ip netns exec fluxguard bpftool map update name blacklist_map key hex 0a 00 01 01 value hex 01 00 00 00
+
+# Phase 3: Verify blacklist_map
+sudo ip netns exec fluxguard bpftool --json map dump name blacklist_map
+
+# Phase 3 TEST: Terminal Window 3 (backend tcpdump)
+sudo ip netns exec backend tcpdump -i veth-backend -n tcp port 80
+
+# Phase 3 TEST: Terminal Window 4 (client flood)  [Stop with Ctrl+C]
+sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2
+
+# Phase 3 TEST (optional): Terminal Window 5 (stop flood without Ctrl+C)
+sudo ip netns exec client pkill -f "hping3 --flood" || true

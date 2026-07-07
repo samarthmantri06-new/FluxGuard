@@ -1,0 +1,9 @@
+# FluxGuard userspace dependencies (Python 3.8+)
+# The kernel program (fluxguard_kern.c) is built with clang/LLVM, not pip.
+# fluxguard_bpf.py talks to bpf(2) via raw ctypes and needs NO third-party package.
+
+prometheus_client>=0.16.0   # optional: only if you swap the stdlib exporter in fluxguard_metrics.py
+flask>=2.2.0                 # fluxguard_api.py (REST API)
+
+# Dev / test only:
+pytest>=7.0.0

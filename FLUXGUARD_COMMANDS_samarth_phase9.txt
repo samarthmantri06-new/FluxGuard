@@ -1,0 +1,608 @@
+# ==============================================================================
+# Phase 9: Fix per-IP blocked status in dashboard, add allowlist management CLI
+# ==============================================================================
+
+# Phase 9: Extend metrics (fluxguard_metrics.py)
+cat > /home/samarth/fluxguard/fluxguard_metrics.py <<'EOF_METRICS_P9'
+#!/usr/bin/env python3
+"""
+FluxGuard Phase 9 — Prometheus text metrics over HTTP.
+"""
+
+from __future__ import annotations
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, Set
+
+class MetricsState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._packets_by_ip: Dict[str, int] = {}
+        self._blocked_ips_set: Set[str] = set()
+        self._blocked_ips = 0
+        self._block_events = 0
+        self._unblock_events = 0
+        self._global_pps_exceeded = 0
+
+    def update_snapshot(self, packets_by_ip: Dict[str, int], blocked_ips: int) -> None:
+        with self._lock:
+            self._packets_by_ip = dict(packets_by_ip)
+            self._blocked_ips = int(blocked_ips)
+
+    def update_blocked_set(self, blocked_set: Set[str]) -> None:
+        with self._lock:
+            self._blocked_ips_set = set(blocked_set)
+
+    def inc_block_events(self) -> None:
+        with self._lock:
+            self._block_events += 1
+
+    def inc_unblock_events(self) -> None:
+        with self._lock:
+            self._unblock_events += 1
+            
+    def inc_global_pps_exceeded(self) -> None:
+        with self._lock:
+            self._global_pps_exceeded += 1
+
+    def render_prometheus_text(self) -> str:
+        with self._lock:
+            packets = sorted(self._packets_by_ip.items())
+            blocked = self._blocked_ips
+            blocked_set = sorted(list(self._blocked_ips_set))
+            be = self._block_events
+            ue = self._unblock_events
+            gpps = self._global_pps_exceeded
+
+        lines = [
+            "# HELP fluxguard_meter_packets Current packet counter per source IP from meter_map.",
+            "# TYPE fluxguard_meter_packets gauge",
+        ]
+        for ip, cnt in packets:
+            safe = ip.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append('fluxguard_meter_packets{ip="%s"} %d' % (safe, cnt))
+        
+        lines.extend([
+            "# HELP fluxguard_blocked_ips Number of IPs currently blocked by the brain.",
+            "# TYPE fluxguard_blocked_ips gauge",
+            "fluxguard_blocked_ips %d" % blocked,
+        ])
+        
+        if blocked_set:
+            lines.extend([
+                "# HELP fluxguard_blocked_ip Per-IP block status (1 = currently blocked).",
+                "# TYPE fluxguard_blocked_ip gauge",
+            ])
+            for ip in blocked_set:
+                safe = ip.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append('fluxguard_blocked_ip{ip="%s"} 1' % safe)
+
+        lines.extend([
+            "# HELP fluxguard_block_events_total Cumulative block events.",
+            "# TYPE fluxguard_block_events_total counter",
+            "fluxguard_block_events_total %d" % be,
+            "# HELP fluxguard_unblock_events_total Cumulative unblock events.",
+            "# TYPE fluxguard_unblock_events_total counter",
+            "fluxguard_unblock_events_total %d" % ue,
+            "# HELP fluxguard_global_pps_exceeded_total Global Shields-Up events triggered.",
+            "# TYPE fluxguard_global_pps_exceeded_total counter",
+            "fluxguard_global_pps_exceeded_total %d" % gpps,
+            "",
+        ])
+        return "\n".join(lines)
+
+def start_metrics_server(state: MetricsState, host: str, port: int) -> threading.Thread:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+        def do_GET(self) -> None:
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = state.render_prometheus_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def run() -> None:
+        server = HTTPServer((host, port), Handler)
+        server.serve_forever()
+
+    thread = threading.Thread(target=run, name="fluxguard-metrics", daemon=True)
+    thread.start()
+    return thread
+EOF_METRICS_P9
+
+# Phase 9: Write updated Python Brain
+cat > /home/samarth/fluxguard/fluxguard_brain.py <<'EOF_BRAIN_P9'
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import ctypes
+import datetime
+import ipaddress
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple, TextIO, Set
+
+from fluxguard_metrics import MetricsState, start_metrics_server
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+class bpf_attr(ctypes.Union):
+    class map_elem(ctypes.Structure):
+        _fields_ = [
+            ("map_fd", ctypes.c_uint32),
+            ("key", ctypes.c_uint64),
+            ("value", ctypes.c_uint64),
+            ("flags", ctypes.c_uint64),
+        ]
+    class obj_get(ctypes.Structure):
+        _fields_ = [
+            ("pathname", ctypes.c_uint64),
+            ("bpf_fd", ctypes.c_uint32),
+            ("file_flags", ctypes.c_uint32),
+        ]
+    _fields_ = [("elem", map_elem), ("obj_get", obj_get)]
+
+def bpf_syscall(cmd: int, attr: bpf_attr) -> int:
+    res = libc.syscall(321, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
+    if res < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return res
+
+def bpf_obj_get(path: str) -> int:
+    attr = bpf_attr()
+    attr.obj_get.pathname = ctypes.cast(ctypes.c_char_p(path.encode()), ctypes.c_void_p).value
+    return bpf_syscall(7, attr)
+
+class BpfKey(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_uint8 * 4)]
+
+class BpfValue(ctypes.Structure):
+    _fields_ = [("val", ctypes.c_uint32)]
+
+class ProtoKey(ctypes.Structure):
+    _fields_ = [("val", ctypes.c_uint8)]
+    
+class PercpuValue(ctypes.Structure):
+    _fields_ = [("vals", ctypes.c_uint64 * 128)]
+
+def key_to_ip(k: BpfKey) -> str:
+    return str(ipaddress.IPv4Address(bytes(k.bytes)))
+
+def ip_to_key(ip_str: str) -> BpfKey:
+    k = BpfKey()
+    k.bytes = (ctypes.c_uint8 * 4)(*ipaddress.IPv4Address(ip_str).packed)
+    return k
+
+def dump_map_u32(fd: int) -> Dict[str, int]:
+    res = {}
+    first_key = BpfKey()
+    current_key = BpfKey()
+    next_key = BpfKey()
+    value = BpfValue()
+    
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = 0
+    attr.elem.value = ctypes.addressof(first_key)
+    
+    try:
+        bpf_syscall(4, attr)
+    except OSError as e:
+        if e.errno == 2:
+            return res
+        raise
+        
+    ctypes.memmove(ctypes.addressof(current_key), ctypes.addressof(first_key), ctypes.sizeof(BpfKey))
+
+    while True:
+        attr_lookup = bpf_attr()
+        attr_lookup.elem.map_fd = fd
+        attr_lookup.elem.key = ctypes.addressof(current_key)
+        attr_lookup.elem.value = ctypes.addressof(value)
+        try:
+            bpf_syscall(1, attr_lookup)
+            res[key_to_ip(current_key)] = value.val
+        except OSError:
+            pass
+            
+        attr_next = bpf_attr()
+        attr_next.elem.map_fd = fd
+        attr_next.elem.key = ctypes.addressof(current_key)
+        attr_next.elem.value = ctypes.addressof(next_key)
+        try:
+            bpf_syscall(4, attr_next)
+            ctypes.memmove(ctypes.addressof(current_key), ctypes.addressof(next_key), ctypes.sizeof(BpfKey))
+        except OSError as e:
+            if e.errno == 2:
+                break
+            break
+            
+    return res
+
+def set_map_u32(fd: int, ip_str: str, val: int) -> None:
+    k = ip_to_key(ip_str)
+    v = BpfValue()
+    v.val = val
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    attr.elem.flags = 0
+    bpf_syscall(2, attr)
+
+def del_map_u32(fd: int, ip_str: str) -> None:
+    k = ip_to_key(ip_str)
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    bpf_syscall(3, attr)
+
+def set_proto_filter(fd: int, proto: int, action: int) -> None:
+    k = ProtoKey()
+    k.val = proto
+    v = BpfValue()
+    v.val = action
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    attr.elem.flags = 0
+    bpf_syscall(2, attr)
+
+def get_global_counter(fd: int) -> int:
+    k = BpfValue()
+    k.val = 0
+    v = PercpuValue()
+    attr = bpf_attr()
+    attr.elem.map_fd = fd
+    attr.elem.key = ctypes.addressof(k)
+    attr.elem.value = ctypes.addressof(v)
+    try:
+        bpf_syscall(1, attr)
+        num_cpus = min(os.cpu_count() or 1, 128)
+        return sum(v.vals[i] for i in range(num_cpus))
+    except OSError:
+        return 0
+
+shutdown_event = threading.Event()
+
+def handle_sigterm(signum: int, frame: Any) -> None:
+    shutdown_event.set()
+
+def write_json_log(fd: TextIO, event: str, fields: Dict[str, Any]) -> None:
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    record: Dict[str, Any] = {"timestamp": ts, "event": event}
+    record.update(fields)
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    fd.write(line)
+    fd.flush()
+
+def monitor(args: argparse.Namespace, metrics: MetricsState, log_fd: TextIO) -> None:
+    base = f"/sys/fs/bpf/{args.netns}"
+    meter_fd = bpf_obj_get(f"{base}/meter_map")
+    blacklist_fd = bpf_obj_get(f"{base}/blacklist_map")
+    allowlist_fd = bpf_obj_get(f"{base}/allowlist_map")
+    proto_fd = bpf_obj_get(f"{base}/proto_filter_map")
+    global_counter_fd = bpf_obj_get(f"{base}/global_counter_map")
+
+    if args.drop_proto is not None:
+        set_proto_filter(proto_fd, args.drop_proto, 1)
+        print(f"Set protocol filter rule: drop protocol {args.drop_proto}")
+
+    prev_counts: Dict[str, int] = {}
+    prev_global = 0
+    prev_ts = time.monotonic()
+    blocked_until: Dict[str, float] = {}
+    allowlist_cache: Dict[str, int] = {}
+    allowlist_ts = 0.0
+
+    print(f"Phase 9 Brain started. threshold={args.pps_threshold:.1f} pps")
+    
+    while not shutdown_event.is_set():
+        now = time.monotonic()
+        dt = now - prev_ts
+        if dt <= 0:
+            dt = args.poll_interval
+
+        if now - allowlist_ts >= 30.0:
+            try:
+                allowlist_cache = dump_map_u32(allowlist_fd)
+                allowlist_ts = now
+            except OSError:
+                pass
+
+        try:
+            curr_counts = dump_map_u32(meter_fd)
+            curr_global = get_global_counter(global_counter_fd)
+        except OSError as exc:
+            time.sleep(args.poll_interval)
+            prev_ts = time.monotonic()
+            continue
+
+        global_pps = (curr_global - prev_global) / dt
+        if global_pps >= args.global_pps_limit:
+            metrics.inc_global_pps_exceeded()
+            print(f"[SHIELDS UP] Global PPS {global_pps:.1f} exceeded limit {args.global_pps_limit}!")
+            write_json_log(log_fd, "SHIELDS_UP", {"global_pps": round(global_pps, 1), "limit": args.global_pps_limit})
+
+        to_block = []
+        for ip, curr in curr_counts.items():
+            if ip in allowlist_cache:
+                continue
+            prev = prev_counts.get(ip, curr)
+            pps = (curr - prev if curr >= prev else curr) / dt
+            if pps >= args.pps_threshold and ip not in blocked_until:
+                to_block.append((ip, pps, curr))
+
+        if to_block:
+            to_block.sort(key=lambda x: x[1], reverse=True)
+            if args.block_batch_size > 0:
+                to_block = to_block[: args.block_batch_size]
+
+            for ip, pps, counter in to_block:
+                try:
+                    set_map_u32(blacklist_fd, ip, 1)
+                    blocked_until[ip] = now + args.cooldown_sec
+                    metrics.inc_block_events()
+                    print(f"[BLOCK] ip={ip} pps={pps:.1f} counter={counter} unblock_in={args.cooldown_sec}s")
+                    write_json_log(log_fd, "BLOCK", {"ip": ip, "pps": round(pps, 6), "counter": counter, "blocked_count": len(blocked_until)})
+                except OSError:
+                    pass
+
+        if blocked_until:
+            expired = [ip for ip, ts in blocked_until.items() if now >= ts]
+            for ip in expired:
+                try:
+                    del_map_u32(blacklist_fd, ip)
+                    metrics.inc_unblock_events()
+                    print(f"[UNBLOCK] ip={ip} cooldown_expired")
+                    write_json_log(log_fd, "UNBLOCK", {"ip": ip, "blocked_count": len(blocked_until) - 1})
+                except OSError:
+                    pass
+                finally:
+                    blocked_until.pop(ip, None)
+
+        metrics.update_blocked_set(set(blocked_until.keys()))
+
+        active_blocked = len(blocked_until)
+        if not args.no_log_ticks:
+            write_json_log(log_fd, "TICK", {"observed_ips": len(curr_counts), "blocked_count": active_blocked, "global_pps": int(global_pps)})
+        metrics.update_snapshot(curr_counts, active_blocked)
+
+        if args.verbose:
+            print(f"[TICK] ips={len(curr_counts)} blocked={active_blocked} global_pps={global_pps:.1f} dt={dt:.3f}s")
+
+        prev_counts = curr_counts
+        prev_global = curr_global
+        prev_ts = now
+        
+        sleep_left = min(args.poll_interval, 1.0)
+        while sleep_left > 0 and not shutdown_event.is_set():
+            chunk = min(0.1, sleep_left)
+            time.sleep(chunk)
+            sleep_left -= chunk
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--netns", default="fluxguard")
+    p.add_argument("--pps-threshold", type=float, default=10000.0)
+    p.add_argument("--global-pps-limit", type=float, default=500000.0)
+    p.add_argument("--poll-interval", type=float, default=0.2)
+    p.add_argument("--cooldown-sec", type=int, default=900)
+    p.add_argument("--block-batch-size", type=int, default=256)
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--no-log-ticks", action="store_true")
+    p.add_argument("--log-file", default="/home/samarth/fluxguard/fluxguard.log")
+    p.add_argument("--metrics-host", default="127.0.0.1")
+    p.add_argument("--metrics-port", type=int, default=9090)
+    p.add_argument("--drop-proto", type=int, help="Protocol ID to drop")
+    args = p.parse_args()
+
+    metrics = MetricsState()
+    start_metrics_server(metrics, args.metrics_host, args.metrics_port)
+
+    with open(args.log_file, "a", encoding="utf-8") as log_fd:
+        try:
+            monitor(args, metrics, log_fd)
+        except Exception as exc:
+            print(f"[FATAL] {exc}", file=sys.stderr)
+            return 1
+            
+    print("\nFluxGuard brain shutdown complete.")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF_BRAIN_P9
+chmod +x /home/samarth/fluxguard/fluxguard_brain.py
+
+# Phase 9: Write Dashboard
+cat > /home/samarth/fluxguard/fluxguard_dashboard.py <<'EOF_DASH_P9'
+#!/usr/bin/env python3
+import argparse
+import time
+import urllib.request
+import signal
+import sys
+
+def fetch_metrics(url: str):
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            return resp.read().decode("utf-8")
+    except Exception:
+        return ""
+
+def render_dashboard(metrics_text: str, prev_packets: dict, dt: float):
+    packets = {}
+    blocked_count = 0
+    block_events = 0
+    unblock_events = 0
+    gpps_events = 0
+    blocked_ips_set = set()
+    
+    for line in metrics_text.split('\n'):
+        if line.startswith('fluxguard_meter_packets{ip="'):
+            ip = line.split('"')[1]
+            cnt = int(line.split()[-1])
+            packets[ip] = cnt
+        elif line.startswith('fluxguard_blocked_ips '):
+            blocked_count = int(line.split()[-1])
+        elif line.startswith('fluxguard_block_events_total '):
+            block_events = int(line.split()[-1])
+        elif line.startswith('fluxguard_unblock_events_total '):
+            unblock_events = int(line.split()[-1])
+        elif line.startswith('fluxguard_global_pps_exceeded_total '):
+            gpps_events = int(line.split()[-1])
+        elif line.startswith('fluxguard_blocked_ip{ip="'):
+            ip = line.split('"')[1]
+            blocked_ips_set.add(ip)
+
+    top_ips = sorted(packets.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    header = f"{'Source IP':<18} | {'Status':<10} | {'Packets':<12} | {'PPS (delta)':<10}"
+    print("\033[2J\033[H", end="")
+    print(f"=== FluxGuard Live Dashboard ===")
+    print(header)
+    print("-" * 55)
+    
+    for ip, cnt in top_ips:
+        prev = prev_packets.get(ip, cnt)
+        pps = (cnt - prev) / dt if dt > 0 else 0.0
+        if ip in blocked_ips_set:
+            status = "\033[31mBLOCKED\033[0m"
+        else:
+            status = "\033[32mACTIVE\033[0m"
+        print(f"{ip:<18} | {status:<19} | {cnt:<12} | {pps:<10.1f}")
+        
+    print("-" * 55)
+    print(f"Total IPs: {len(packets)}  |  Total Blocked: \033[31m{blocked_count}\033[0m  |  Shields Up: {gpps_events}")
+    print(f"Events: Blocks={block_events} Unblocks={unblock_events}")
+    
+    return packets
+
+def handle_sigterm(s, f):
+    print("\033[0m\nExiting.")
+    sys.exit(0)
+
+def main():
+    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    p = argparse.ArgumentParser()
+    p.add_argument("--metrics-url", default="http://127.0.0.1:9090/metrics")
+    p.add_argument("--refresh", type=float, default=2.0)
+    args = p.parse_args()
+
+    prev_packets = {}
+    last_time = time.time()
+    
+    while True:
+        m = fetch_metrics(args.metrics_url)
+        now = time.time()
+        dt = now - last_time if now > last_time else args.refresh
+        if m:
+            prev_packets = render_dashboard(m, prev_packets, dt)
+        last_time = now
+        time.sleep(args.refresh)
+
+if __name__ == "__main__":
+    main()
+EOF_DASH_P9
+chmod +x /home/samarth/fluxguard/fluxguard_dashboard.py
+
+# Phase 9: Write allowlist management CLI (fluxguard_allow.py)
+cat > /home/samarth/fluxguard/fluxguard_allow.py <<'EOF_ALLOW_P9'
+#!/usr/bin/env python3
+import argparse
+import sys
+from fluxguard_brain import bpf_obj_get, set_map_u32, del_map_u32, dump_map_u32
+
+def main():
+    p = argparse.ArgumentParser(description="FluxGuard Allowlist Management")
+    p.add_argument("action", choices=["add", "del", "list"])
+    p.add_argument("ip", nargs="?", help="IP address to add/del")
+    p.add_argument("--map-path", default="/sys/fs/bpf/fluxguard/allowlist_map")
+    args = p.parse_args()
+
+    try:
+        fd = bpf_obj_get(args.map_path)
+    except Exception as e:
+        print(f"Error accessing map at {args.map_path}: {e}")
+        return 1
+
+    if args.action == "list":
+        try:
+            entries = dump_map_u32(fd)
+            if not entries:
+                print("allowlist is empty")
+            else:
+                for ip in entries:
+                    print(ip)
+        except Exception as e:
+            print(f"Error listing allowlist: {e}")
+            return 1
+
+    elif args.action == "add":
+        if not args.ip:
+            print("Error: IP address required for add")
+            return 1
+        try:
+            set_map_u32(fd, args.ip, 1)
+            print(f"[ALLOW] added {args.ip}")
+        except Exception as e:
+            print(f"Error adding {args.ip}: {e}")
+            return 1
+
+    elif args.action == "del":
+        if not args.ip:
+            print("Error: IP address required for del")
+            return 1
+        try:
+            del_map_u32(fd, args.ip)
+            print(f"[ALLOW] removed {args.ip}")
+        except Exception as e:
+            print(f"Error removing {args.ip}: {e}")
+            return 1
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF_ALLOW_P9
+chmod +x /home/samarth/fluxguard/fluxguard_allow.py
+
+# Phase 9 TEST: Terminal Window 38 (Confirm new metric appears)
+curl -s http://127.0.0.1:9090/metrics | grep fluxguard_blocked_ip
+
+# Phase 9 TEST: Terminal Window 39 (Launch dashboard)
+python3 /home/samarth/fluxguard/fluxguard_dashboard.py --metrics-url http://127.0.0.1:9090/metrics --refresh 2
+
+# Phase 9 TEST: Terminal Window 40 (Test allowlist add)
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py add 10.0.1.5
+
+# Phase 9 TEST: Terminal Window 41 (Test allowlist list)
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py list
+
+# Phase 9 TEST: Terminal Window 42 (Confirm allowlisted IP passes through even under flood)
+sudo ip netns exec client hping3 --flood -S -p 80 -a 10.0.1.5 10.0.2.2
+
+# Phase 9 TEST: Terminal Window 43 (Test allowlist del)
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py del 10.0.1.5
+sudo python3 /home/samarth/fluxguard/fluxguard_allow.py list
+
+# Phase 9 TEST: Terminal Window 44 (optional - Graceful shutdown)
+# sudo pkill -TERM -f fluxguard_brain.py

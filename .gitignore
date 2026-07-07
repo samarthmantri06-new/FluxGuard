@@ -1,0 +1,33 @@
+# Build artifacts
+*.o
+*.ll
+*.bc
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# FluxGuard runtime state (do NOT commit live block state or logs)
+blocked_ips.json
+*.log
+fluxguard.log
+
+# graphify knowledge-graph output (generated artifact)
+graphify-out/
+
+# codebase dump utility output (generated)
+codebase_dump.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/

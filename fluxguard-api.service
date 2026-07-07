@@ -1,0 +1,28 @@
+# FluxGuard REST API systemd unit (optional).
+#
+# Install:
+#   sudo cp fluxguard-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fluxguard-api.service
+#   sudo systemctl status fluxguard-api.service
+#
+# Starts the Flask API after the brain. Reads the same pinned BPF maps, so the
+# XDP program must already be loaded and pinned under /sys/fs/bpf/fluxguard.
+# Configuration (bind host/port, auth token) comes from /etc/fluxguard/config.json.
+
+[Unit]
+Description=FluxGuard REST API
+Documentation=https://github.com/your-username/fluxguard
+After=network-online.target fluxguard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/samarth/fluxguard
+ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/fluxguard_api.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
