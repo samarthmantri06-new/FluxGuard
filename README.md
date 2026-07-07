@@ -82,6 +82,27 @@ Every userspace component imports `fluxguard_bpf.py` — the **only** module tha
 
 ---
 
+## Project structure
+
+```
+src/                     application code (kernel + control plane)
+  fluxguard_kern.c         XDP/eBPF filter (source of truth)
+  fluxguard_bpf.py         raw bpf(2) syscall layer (ctypes)
+  fluxguard_brain.py       control loop / block lifecycle
+  fluxguard_metrics.py     Prometheus exporter
+  fluxguard_dashboard.py   read-only TUI
+  fluxguard_allow.py       allowlist CLI
+  fluxguard_api.py         Flask REST API
+  fluxguard_config.py      config dataclass + JSON loader
+tests/                   pure-Python unit tests (no root, no BPF)
+scripts/                 helper scripts (load test, codebase dump)
+docs/                    design writeups (phaseNN-*.md) + runbooks/ (command logs)
+.github/workflows/       CI
+Makefile                 build / attach / run / test entrypoints
+```
+
+Everything is driven through the `Makefile` — you rarely invoke files in `src/` by hand.
+
 ## Build & run (Linux, root)
 
 ```bash
@@ -114,7 +135,7 @@ The full labeled test plan (TEST 1–13) lives in the phase runbooks (see below)
 Pure-Python unit tests that run on **any** OS (no root, no BPF):
 
 ```bash
-make test        # or: python3 -m pytest test_fluxguard.py -v
+make test        # or: python3 -m pytest tests/ -v
 ```
 
 They cover the token-bucket refill math (mirror of the C helper), IP↔key round-tripping,
@@ -125,7 +146,7 @@ and config loading.
 ## Project history
 
 Built from scratch in numbered phases. Each phase has a runbook
-(`FLUXGUARD_COMMANDS_samarth_phaseN.txt`) and a design writeup (`phaseN_phaseM_explained.md`):
+(`docs/runbooks/phaseNN-*.txt`) and a design writeup (`docs/phaseNN-*.md`):
 
 | Phase | Milestone |
 |-------|-----------|

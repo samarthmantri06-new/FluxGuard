@@ -13,7 +13,7 @@
 
 [Unit]
 Description=FluxGuard XDP/eBPF DDoS mitigation - control loop (brain)
-Documentation=https://github.com/your-username/fluxguard
+Documentation=https://github.com/samarthmantri06-new/FluxGuard
 After=network-online.target
 Wants=network-online.target
 
@@ -21,7 +21,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/home/samarth/fluxguard
-ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/fluxguard_brain.py \
+ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/src/fluxguard_brain.py \
     --netns fluxguard \
     --poll-interval 0.2 \
     --cooldown-sec 30 \

@@ -20,8 +20,11 @@ ARCH        := $(shell uname -m)
 CLANG       ?= clang
 PYTHON      ?= python3
 
-KERN_SRC    := fluxguard_kern.c
-KERN_OBJ    := fluxguard_kern.o
+SRC_DIR     := src
+TEST_DIR    := tests
+
+KERN_SRC    := $(SRC_DIR)/fluxguard_kern.c
+KERN_OBJ    := $(SRC_DIR)/fluxguard_kern.o
 
 IFACE       ?= eth0
 XDP_MODE    ?= xdpgeneric          # xdpgeneric (VM/VirtualBox) | xdpdrv (real NIC)
@@ -69,19 +72,19 @@ detach:   # remove XDP program from IFACE and unpin maps
 	@echo "Detached XDP from $(IFACE); removed $(PIN_DIR)"
 
 run-brain:   # start the control loop (reads pinned maps)
-	$(PYTHON) fluxguard_brain.py --netns $(NETNS) --poll-interval 0.2 \
+	$(PYTHON) $(SRC_DIR)/fluxguard_brain.py --netns $(NETNS) --poll-interval 0.2 \
 		--cooldown-sec 30 --allowlist-refresh-sec 5 --verbose
 
 run-dashboard:   # read-only TUI
-	$(PYTHON) fluxguard_dashboard.py \
+	$(PYTHON) $(SRC_DIR)/fluxguard_dashboard.py \
 		--metrics-url http://127.0.0.1:9090/metrics \
 		--ringbuf-path $(PIN_DIR)/event_ringbuf --refresh 2.0
 
 run-api:   # Flask REST API
-	$(PYTHON) fluxguard_api.py
+	$(PYTHON) $(SRC_DIR)/fluxguard_api.py
 
 test:   # pure-python unit tests (no root, no BPF, runs anywhere)
-	$(PYTHON) -m pytest test_fluxguard.py -v
+	$(PYTHON) -m pytest $(TEST_DIR) -v
 
 clean:   # remove build artifacts
 	rm -f $(KERN_OBJ) *.ll *.bc

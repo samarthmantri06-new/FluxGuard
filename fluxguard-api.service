@@ -12,7 +12,7 @@
 
 [Unit]
 Description=FluxGuard REST API
-Documentation=https://github.com/your-username/fluxguard
+Documentation=https://github.com/samarthmantri06-new/FluxGuard
 After=network-online.target fluxguard.service
 Wants=network-online.target
 
@@ -20,7 +20,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/home/samarth/fluxguard
-ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/fluxguard_api.py
+ExecStart=/home/samarth/fluxguard/venv/bin/python /home/samarth/fluxguard/src/fluxguard_api.py
 Restart=on-failure
 RestartSec=3
 

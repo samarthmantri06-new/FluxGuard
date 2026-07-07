@@ -1,8 +1,10 @@
 import os
 
 # --- Configuration ---
-OUTPUT_FILE = "codebase_dump.txt"
-ROOT_DIR = "."
+# Script lives in scripts/; walk the repo root (its parent) regardless of cwd.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUTPUT_FILE = os.path.join(_REPO_ROOT, "codebase_dump.txt")
+ROOT_DIR = _REPO_ROOT
 
 # Directories to skip completely
 EXCLUDE_DIRS = {
