@@ -60,7 +60,7 @@ between the Python processes other than these maps (plus the on-disk checkpoint/
 - **`fluxguard_config.py`** — `FluxGuardConfig` dataclass + JSON loader
   (`/etc/fluxguard/config.json`), imported by brain and API.
 
-- **`some.py`** — dev utility that concatenates the codebase into `codebase_dump.txt`
+- **`scripts/dump_codebase.py`** — dev utility that concatenates the codebase into `codebase_dump.txt`
   (the dump is a generated artifact, not source).
 
 ### Things to know before editing

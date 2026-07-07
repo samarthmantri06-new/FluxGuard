@@ -3,7 +3,7 @@
 #
 # The kernel object is built with clang/LLVM targeting BPF. Attaching XDP and
 # pinning maps requires root. This Makefile consolidates the per-phase runbooks
-# (FLUXGUARD_COMMANDS_samarth_phaseN.txt) into single commands.
+# (docs/runbooks/phaseNN-*.txt) into single commands.
 #
 # Quick start (netns lab):
 #   make build          # compile fluxguard_kern.o

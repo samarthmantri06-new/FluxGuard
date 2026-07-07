@@ -6,9 +6,9 @@ These run on ANY OS with no root and no BPF — they exercise the parts of FluxG
 that are pure logic. Tests that need the raw bpf(2) syscall layer (fluxguard_bpf, which
 loads libc.so.6 at import) are skipped automatically on non-Linux hosts.
 
-    python3 -m pytest test_fluxguard.py -v
+    python3 -m pytest tests/ -v
     # or, without pytest installed:
-    python3 test_fluxguard.py
+    python3 tests/test_fluxguard.py
 """
 
 import os
