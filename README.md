@@ -162,11 +162,26 @@ sudo python3 scripts/load_test.py \
 It needs root, a real kernel, and a loaded XDP program, so it **cannot run in CI** — run it
 in the Ubuntu VM / netns lab.
 
-Measured results (fill in after running on your hardware — replace this placeholder):
+Measured results — Intel Core i5-13420H (2 vCPU), kernel 6.17.0-35-generic, **xdpgeneric**
+on a `veth` netns lab, 5 s per step, single-source `hping3`:
 
-| Target PPS | Sent | Passed | Dropped | Drop % | XDP ns/pkt | XDP CPU % | Env |
-|-----------:|-----:|-------:|--------:|-------:|-----------:|----------:|-----|
-| _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _CPU model, kernel, xdpgeneric/xdpdrv_ |
+| Target PPS | Sent | Passed | Dropped | Drop % | XDP ns/pkt | XDP CPU % |
+|-----------:|-----:|-------:|--------:|-------:|-----------:|----------:|
+|      1,000 |   581 |  581 |     0 |   0.04 % |  2,228 | 0.13 % |
+|      5,000 | 1,201 |   71 | 1,130 |  94.07 % |  1,981 | 0.24 % |
+|     20,000 | 1,887 |    0 | 1,887 |  99.99 % |  1,876 | 0.35 % |
+|    100,000 | 1,061 |    0 | 1,061 | 100.00 % |  3,467 | 0.37 % |
+|    500,000 | 1,022 |    0 | 1,022 | 100.00 % |  1,659 | 0.17 % |
+
+What this shows and does **not** show: below the 1,000 pps/IP limit traffic passes cleanly
+(0.04 % drop); once a single source sustains more than that it is auto-blacklisted in-kernel
+and ~100 % of its packets are dropped — the per-IP token bucket works as designed, at a
+per-packet cost of ~1.2–3.5 µs in generic mode (a direct `bpftool` run-stat probe over a
+50,000-packet burst measured **1,199 ns/packet, 0.21 % of one core**). The *Sent* column
+also shows `hping3` from one namespace tops out near ~1–2 k pps here, so the **500,000 pps
+policy ceiling was not reached** — saturating it needs a kernel-space generator (`pktgen`/
+`trafgen`), multiple sources, and native (`xdpdrv`) mode on a real NIC. These numbers
+validate correctness and per-packet cost, not aggregate throughput.
 
 > **TODO:** record a short demo GIF (asciinema/terminal capture) of a live flood being
 > auto-blocked, and embed it here. (Recording is a manual step — not scriptable from CI.)
