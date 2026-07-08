@@ -9,11 +9,12 @@ packets ever reach the network stack — using an XDP/eBPF program. A userspace 
 manages the block lifecycle, exposes Prometheus metrics, and persists state, talking to the
 kernel **only** through pinned eBPF maps.
 
-> **Scope note:** FluxGuard is a systems-programming project, validated in a Linux network-namespace
-> lab and an Ubuntu VM (see the runbooks in `docs/runbooks/`). The configured ceiling
-> (`GLOBAL_PPS_LIMIT = 500000`) is a *policy limit*, not a hardware benchmark. A repeatable
-> benchmark harness lives at `scripts/load_test.py`; see [Performance](#performance) for how to
-> run it and record real numbers.
+> **Scope & Limitations Note:** FluxGuard is an educational systems-programming project, built and validated in an isolated Linux network-namespace (`netns`) lab on an Ubuntu VM. It is **not** a production-ready cloud appliance. 
+> 
+> **Things we CANNOT perform or test in this environment:**
+> 1. **True Line-Rate Performance:** We cannot benchmark true hardware limits (like hitting the 500k-1M+ PPS policy caps). Our userspace traffic generator (`hping3` over `veth` pairs) bottlenecks around ~20k PPS. To test real throughput, we would need in-kernel generators (`pktgen`) and a dedicated hardware testbed.
+> 2. **Native XDP Driver Mode (`xdpdrv`):** We are running in `xdpgeneric` mode (which happens *after* `skb` allocation). We cannot test `xdpdrv` because we are using virtual `veth` interfaces, so we aren't seeing the absolute lowest-latency benefits of XDP.
+> 3. **Real-World Topologies:** This is a local VM lab. We cannot model real internet latency, complex NIC driver multi-queueing, or distributed spoofed MAC addresses.
 
 ---
 
