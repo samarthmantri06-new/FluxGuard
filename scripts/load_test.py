@@ -119,19 +119,25 @@ def restore_bpf_stats(was_already_on: bool) -> None:
 
 
 def run_step(args: argparse.Namespace, pps: int) -> Dict[str, float]:
-    interval_us = max(1, 1_000_000 // pps)
     count = pps * args.duration
+    workers = min(args.max_workers, max(1, pps // 1000 + (1 if pps % 1000 else 0))) if pps >= 1000 else 1
+    pps_per_worker = max(1, pps // workers)
+    count_per_worker = max(1, count // workers)
+    interval_us = max(1, 1_000_000 // pps_per_worker)
 
     tx0 = read_iface_counter(args.client_ns, args.client_if, "tx")
     rx0 = read_iface_counter(args.backend_ns, args.backend_if, "rx")
     ns0, cnt0 = bpf_prog_stats(args.prog_name)
     t0 = time.monotonic()
 
-    hping = ["hping3", "-S", "-p", str(args.port), "-i", f"u{interval_us}",
-             "-c", str(count), args.target]
-    cmd = (["ip", "netns", "exec", args.client_ns] + hping) if args.client_ns else hping
-    # hping3 prints a summary to stderr; suppress and let it finish the -c count.
-    subprocess.run(cmd, capture_output=True, text=True)
+    procs = []
+    for _ in range(workers):
+        hping = ["hping3", "-S", "-p", str(args.port), "-i", f"u{interval_us}",
+                 "-c", str(count_per_worker), args.target]
+        cmd = (["ip", "netns", "exec", args.client_ns] + hping) if args.client_ns else hping
+        procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    for p in procs:
+        p.wait()
 
     dt = time.monotonic() - t0
     tx1 = read_iface_counter(args.client_ns, args.client_if, "tx")
@@ -170,6 +176,7 @@ def main() -> int:
     p.add_argument("--rates", default="1000,5000,20000,100000,500000",
                    help="comma-separated target PPS steps")
     p.add_argument("--duration", type=int, default=5, help="seconds per rate step")
+    p.add_argument("--max-workers", type=int, default=1, help="Max parallel hping3 workers")
     p.add_argument("--csv", default="", help="optional path to write CSV results")
     args = p.parse_args()
     # Empty string means "host namespace".
@@ -195,6 +202,8 @@ def main() -> int:
             print("{:>10} {:>12.0f} {:>12.0f} {:>12.0f} {:>8.1f}% {:>11.1f} {:>10.1f}%".format(
                 row["target_pps"], row["pps_sent"], row["pps_passed"],
                 row["pps_dropped"], row["drop_pct"], row["xdp_ns_pkt"], row["xdp_cpu_pct"]))
+            if row["pps_sent"] < pps * 0.7:
+                print(f"  [WARNING] generator_bottleneck: sent {row['pps_sent']:.0f} pps, target was {pps}. Try increasing --max-workers.")
     finally:
         restore_bpf_stats(was_on)
 

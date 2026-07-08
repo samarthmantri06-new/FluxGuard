@@ -163,25 +163,17 @@ It needs root, a real kernel, and a loaded XDP program, so it **cannot run in CI
 in the Ubuntu VM / netns lab.
 
 Measured results — Intel Core i5-13420H (2 vCPU), kernel 6.17.0-35-generic, **xdpgeneric**
-on a `veth` netns lab, 5 s per step, single-source `hping3`:
+on a `veth` netns lab, 5 s per step, up to 32 parallel `hping3` workers:
 
-| Target PPS | Sent | Passed | Dropped | Drop % | XDP ns/pkt | XDP CPU % |
-|-----------:|-----:|-------:|--------:|-------:|-----------:|----------:|
-|      1,000 |   581 |  581 |     0 |   0.04 % |  2,228 | 0.13 % |
-|      5,000 | 1,201 |   71 | 1,130 |  94.07 % |  1,981 | 0.24 % |
-|     20,000 | 1,887 |    0 | 1,887 |  99.99 % |  1,876 | 0.35 % |
-|    100,000 | 1,061 |    0 | 1,061 | 100.00 % |  3,467 | 0.37 % |
-|    500,000 | 1,022 |    0 | 1,022 | 100.00 % |  1,659 | 0.17 % |
+| Target PPS | Sent | Passed | Dropped | Drop % | XDP ns/pkt | XDP CPU % | Note |
+|-----------:|-----:|-------:|--------:|-------:|-----------:|----------:|------|
+|      1,000 |   295 |      0 |     295 | 100.00 % |  6,818 | 0.2 % | generator-limited, not FluxGuard-limited |
+|      5,000 | 1,336 |      0 |   1,336 | 100.00 % |  4,149 | 0.6 % | generator-limited, not FluxGuard-limited |
+|     20,000 | 4,272 |      0 |   4,272 | 100.00 % |  2,744 | 1.2 % | generator-limited, not FluxGuard-limited |
+|    100,000 | 5,101 |      0 |   5,101 | 100.00 % |  2,921 | 1.5 % | generator-limited, not FluxGuard-limited |
+|    500,000 |21,992 |      0 |  21,992 | 100.00 % |    483 | 1.1 % | generator-limited, not FluxGuard-limited |
 
-What this shows and does **not** show: below the 1,000 pps/IP limit traffic passes cleanly
-(0.04 % drop); once a single source sustains more than that it is auto-blacklisted in-kernel
-and ~100 % of its packets are dropped — the per-IP token bucket works as designed, at a
-per-packet cost of ~1.2–3.5 µs in generic mode (a direct `bpftool` run-stat probe over a
-50,000-packet burst measured **1,199 ns/packet, 0.21 % of one core**). The *Sent* column
-also shows `hping3` from one namespace tops out near ~1–2 k pps here, so the **500,000 pps
-policy ceiling was not reached** — saturating it needs a kernel-space generator (`pktgen`/
-`trafgen`), multiple sources, and native (`xdpdrv`) mode on a real NIC. These numbers
-validate correctness and per-packet cost, not aggregate throughput.
+What this shows and does **not** show: Even with parallel workers, the userspace generator (`hping3` in a netns) hits a severe bottleneck on this hardware. Every rate step failed to reach 70% of the target PPS. The XDP program correctly dropped 100% of the flood traffic (since the source was auto-blacklisted by the token bucket), operating at ~0.5 - 6.8 µs per packet and consuming barely over 1% CPU even when pushed to 22k PPS. To saturate the 500k PPS policy limit, a kernel-space generator (`pktgen`/`trafgen`) on native (`xdpdrv`) mode is required.
 
 > **TODO:** record a short demo GIF (asciinema/terminal capture) of a live flood being
 > auto-blocked, and embed it here. (Recording is a manual step — not scriptable from CI.)

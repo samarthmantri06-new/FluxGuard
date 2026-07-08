@@ -1,36 +1,19 @@
-# Phase 1: Install dependencies
-sudo apt update && sudo apt install -y \
-  clang llvm libelf-dev libpcap-dev gcc-multilib build-essential \
-  linux-tools-$(uname -r) linux-headers-$(uname -r) linux-tools-common \
-  m4 pkg-config iproute2 python3 python3-pip hping3 tcpdump curl
-
-# Phase 1: Reset old namespaces (ignore errors)
 sudo ip netns del client 2>/dev/null || true
 sudo ip netns del fluxguard 2>/dev/null || true
 sudo ip netns del backend 2>/dev/null || true
-
-# Phase 1: Create namespaces
 sudo ip netns add client
 sudo ip netns add fluxguard
 sudo ip netns add backend
-
-# Phase 1: Create veth pairs
 sudo ip link add veth-client type veth peer name veth-fg-in
 sudo ip link add veth-fg-out type veth peer name veth-backend
-
-# Phase 1: Move interfaces into namespaces
 sudo ip link set veth-client netns client
 sudo ip link set veth-fg-in netns fluxguard
 sudo ip link set veth-fg-out netns fluxguard
 sudo ip link set veth-backend netns backend
-
-# Phase 1: Assign IP addresses
 sudo ip netns exec client ip addr add 10.0.1.1/24 dev veth-client
 sudo ip netns exec fluxguard ip addr add 10.0.1.2/24 dev veth-fg-in
 sudo ip netns exec fluxguard ip addr add 10.0.2.1/24 dev veth-fg-out
 sudo ip netns exec backend ip addr add 10.0.2.2/24 dev veth-backend
-
-# Phase 1: Bring interfaces up
 sudo ip netns exec client ip link set lo up
 sudo ip netns exec client ip link set veth-client up
 sudo ip netns exec fluxguard ip link set lo up
@@ -38,20 +21,6 @@ sudo ip netns exec fluxguard ip link set veth-fg-in up
 sudo ip netns exec fluxguard ip link set veth-fg-out up
 sudo ip netns exec backend ip link set lo up
 sudo ip netns exec backend ip link set veth-backend up
-
-# Phase 1: Routing + forwarding
 sudo ip netns exec client ip route add default via 10.0.1.2
 sudo ip netns exec backend ip route add default via 10.0.2.1
 sudo ip netns exec fluxguard sysctl -w net.ipv4.ip_forward=1
-
-# Phase 1: Quick connectivity test
-sudo ip netns exec client ping -c 2 10.0.2.2
-
-# Phase 1 TEST: Terminal Window 1 (backend tcpdump)
-sudo ip netns exec backend tcpdump -i veth-backend -n tcp port 80
-
-# Phase 1 TEST: Terminal Window 2 (client flood)  [Stop with Ctrl+C]
-sudo ip netns exec client hping3 --flood -S -p 80 10.0.2.2
-
-# Phase 1 TEST (optional): Terminal Window 3 (stop flood without Ctrl+C)
-sudo ip netns exec client pkill -f "hping3 --flood" || true

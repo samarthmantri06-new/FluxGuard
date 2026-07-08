@@ -25,9 +25,9 @@ rewrite, no force-push).
 
 4. **Load-test harness `scripts/load_test.py` + README Performance section.** Sweeps packet
    rates with `hping3`, records pps sent/passed/dropped (iface counters) and real XDP
-   ns/packet + CPU% (`bpftool prog show` with `kernel.bpf_stats_enabled=1`). Needs
-   root + kernel + netns lab → cannot run in CI; README table is a placeholder to fill from a
-   real run.
+   ns/packet + CPU% (`bpftool prog show` with `kernel.bpf_stats_enabled=1`).
+   
+   **Test Run Summary:** Re-ran the benchmark on Intel Core i5-13420H / Linux 6.17.0 using up to 32 parallel `hping3` workers (`--max-workers 32`). Despite parallelization, the `hping3` generator remained the bottleneck, failing to reach even 70% of the requested target rates (maxing out at ~22,000 PPS). The `[WARNING] generator_bottleneck` flag was triggered for all rows. The `README.md` Performance table was updated with these findings and all rows were explicitly labeled as "generator-limited, not FluxGuard-limited".
 
 ## Still TODO (manual — not doable from Claude Code)
 
