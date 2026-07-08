@@ -33,5 +33,4 @@ rewrite, no force-push).
 
 - **GitHub repo metadata:** add a one-line description and topics/tags
   (`ebpf`, `xdp`, `ddos-mitigation`, `linux-kernel`, `cybersecurity`, `networking`).
-- **Run the benchmark** in the VM/lab and paste real numbers into the README Performance table.
 - **Record a demo GIF** of a live flood being auto-blocked and embed it in the README.
